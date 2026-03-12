@@ -143,12 +143,19 @@ function ltcgStack(ordTaxable, ltcgAmt, brackets) {
   return tax;
 }
 
-function computeTax(profile, streams, assets, deductions) {
+function computeTax(profile, streams, assets, deductions, entities) {
   const p = TAX_PARAMS[profile.filingStatus] || TAX_PARAMS.mfj;
+
+  // Build entity lookup by label
+  const entMap = {};
+  (entities||[]).forEach(e => { entMap[e.label] = e; });
 
   // Step 1: Aggregate income by six characters + withholding
   let ordEarned=0, ordInv=0, stcg=0, ltcg=0, qualDiv=0, passive=0, taxExempt=0;
   let totalFedWithholding=0, totalStateWithholding=0;
+
+  // Track K-1 income per entity for PTET computation
+  const k1ByEntity = {};
   streams.forEach(s => {
     const t = INCOME_TYPES[s.type];
     if (!t) return;
@@ -160,9 +167,13 @@ function computeTax(profile, streams, assets, deductions) {
     else if (t.char==="qualDiv") qualDiv+=a;
     else if (t.char==="passive") passive+=a;
     else if (t.char==="taxExempt") taxExempt+=a;
-    // Withholding
+    // Withholding (stream-level, for W-2 etc.)
     totalFedWithholding += a * (s.fedWithholdingPct||0) / 100;
     totalStateWithholding += a * (s.stateWithholdingPct||0) / 100;
+    // Track K-1 income by entity for PTET
+    if (s.type.startsWith("k1_")) {
+      k1ByEntity[s.entity] = (k1ByEntity[s.entity]||0) + a;
+    }
   });
 
   // From assets — all asset types that generate income
@@ -170,10 +181,8 @@ function computeTax(profile, streams, assets, deductions) {
   assets.forEach(item => {
     const at = item.assetType;
     if (at==="cash") {
-      // Cash/money market → interest income (ordinary investment)
       ordInv += (item.value||0) * (item.yieldPct||0) / 100;
     } else if (at==="security") {
-      // Public securities → qualified dividends + realized gains
       qualDiv += (item.value||0) * (item.divYieldPct||0) / 100;
       ltcg += (item.value||0) * (item.realizedGainPct||0) / 100;
     } else if (at==="hedgeFund" || at==="peFund") {
@@ -188,6 +197,33 @@ function computeTax(profile, streams, assets, deductions) {
       invCapCalls += (item.unfunded||0) * (item.capCallPct || 0) / 100;
     }
   });
+
+  // Step 1b: Entity-level pre-tax deductions
+  let totalPTET=0, totalRetirement=0, totalHealthIns=0;
+  const pteDetails = [];
+  Object.entries(k1ByEntity).forEach(([entityLabel, k1Income]) => {
+    const ent = entMap[entityLabel];
+    if (!ent) return;
+    // PTET
+    if (ent.pteElection && (ent.pteRate||0) > 0) {
+      const pteAmt = Math.abs(k1Income) * (ent.pteRate/100);
+      totalPTET += pteAmt;
+      pteDetails.push({entity:entityLabel, income:k1Income, rate:ent.pteRate, amount:pteAmt, state:ent.pteState||profile.state});
+    }
+    // Retirement contributions (reduce K-1 ordinary income)
+    if ((ent.retirementContrib||0) > 0) totalRetirement += ent.retirementContrib;
+    // Health insurance (above-the-line deduction)
+    if ((ent.healthInsurance||0) > 0) totalHealthIns += ent.healthInsurance;
+  });
+
+  // Apply pre-tax deductions: PTET + retirement reduce earned income
+  // PTET is a partnership-level deduction that reduces K-1 income before the 1040
+  // Retirement contributions reduce K-1 ordinary income
+  const preTaxDeductions = totalPTET + totalRetirement;
+  ordEarned = ordEarned - preTaxDeductions;
+
+  // PTET generates a state tax credit (dollar for dollar)
+  // Health insurance is an above-the-line deduction (self-employed health)
 
   // Step 2: Schedule D capital gain netting
   let netST = stcg, netLT = ltcg;
@@ -208,7 +244,8 @@ function computeTax(profile, streams, assets, deductions) {
   }
 
   // Step 3: Taxable income
-  const totalOrdinary = ordEarned + ordInv + passive + netSTAfter - capitalLossOffset;
+  // Health insurance is above-the-line (reduces AGI)
+  const totalOrdinary = ordEarned + ordInv + passive + netSTAfter - capitalLossOffset - totalHealthIns;
   const totalPref = netLTAfter + qualDiv;
   const agi = Math.max(0, totalOrdinary + totalPref);
 
@@ -236,15 +273,17 @@ function computeTax(profile, streams, assets, deductions) {
   const niit = Math.min(nii, niitBase) * 0.038;
 
   const federalTax = ordTax + prefTax + niit;
-  const stateTax = Math.max(0, agi * ((profile.stateRate||0)/100) * 0.88);
-  const totalTax = federalTax + stateTax;
+  const stateGross = Math.max(0, agi * ((profile.stateRate||0)/100) * 0.88);
+  const stateTaxAfterPTE = Math.max(0, stateGross - totalPTET);
+  const stateTax = stateGross; // gross liability before credit
+  const totalTax = federalTax + stateTaxAfterPTE;
 
   const topBracket = p.brackets.slice().reverse().find(([,min]) => taxableOrd > min);
   const marginalOrd = topBracket ? topBracket[0]*100 : 10;
   const topPrefBr = p.ltcg.slice().reverse().find(([,min]) => (taxableOrd+taxablePref) > min);
   const marginalPref = topPrefBr ? topPrefBr[0]*100 : 0;
 
-  // Safe harbor — withholding counts toward prepayment
+  // Safe harbor -- withholding + PTET count toward prepayment
   const priorY = profile.priorYearLiability||0;
   const priorAgi = profile.priorYearAgi||0;
   const safeHarborPY = priorY * (priorAgi>150000?1.10:1.00);
@@ -255,21 +294,25 @@ function computeTax(profile, streams, assets, deductions) {
   const remainingSH = safeHarborPY>0 ? Math.max(0,safeHarborTarget-totalPrepaid) : 0;
   const penaltyEst = remainingSH * 0.08;
 
-  // Balance due after all prepayments
-  const balanceDueFed = Math.max(0, (federalTax) - totalFedWithholding - totalEstPaid);
-  const balanceDueState = Math.max(0, stateTax - totalStateWithholding);
+  // Balance due
+  const balanceDueFed = Math.max(0, federalTax - totalFedWithholding - totalEstPaid);
+  const balanceDueState = Math.max(0, stateGross - totalPTET - totalStateWithholding);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
 
-  // Net cash — income is NET of withholding (what actually deposits)
+  // Net cash
   const totalWithholding = totalFedWithholding + totalStateWithholding;
   const grossIncome = agi + taxExempt;
   const netAfterWithholding = grossIncome - totalWithholding;
   const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
+    - totalPTET - totalRetirement - totalHealthIns
     - (profile.livingExpenses||0)*12 - (profile.debtService||0)*12
     + invDistributions - invCapCalls;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
   const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
+
+  // Federal tax savings from PTET (the SALT workaround benefit)
+  const pteFedSavings = totalPTET * (marginalOrd/100);
 
   return {
     ordEarned, ordInv, stcg, ltcg, qualDiv, passive, taxExempt,
@@ -278,13 +321,15 @@ function computeTax(profile, streams, assets, deductions) {
     totalOrdinary, totalPref, agi,
     qbiDeduction, itemizedRaw, useItemized, deductionAmt,
     taxableOrd, taxablePref,
-    ordTax, prefTax, niit, nii, federalTax, stateTax, totalTax,
+    ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
     effectiveFederal: agi>0 ? federalTax/agi*100 : 0,
     marginalOrd, marginalPref,
+    // Entity-level deductions
+    totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
     // Withholding
     totalFedWithholding, totalStateWithholding, totalWithholding,
-    // Safe harbor (now includes withholding)
+    // Safe harbor
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
     remainingSH, penaltyEst,
     balanceDueFed, balanceDueState, overpaymentFed,
@@ -476,7 +521,7 @@ function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
   const [s, setS] = useState(stream || {
     id: uid(), type: "w2", label: "", amount: 0, timing: "monthly", timingMonth: 11,
     qbi: false, entity: "",
-    fedWithholdingPct: 0, stateWithholdingPct: 0, pteElection: false,
+    fedWithholdingPct: 0, stateWithholdingPct: 0,
   });
   const upd = (k, v) => setS(prev => ({ ...prev, [k]: v }));
   const typeInfo = INCOME_TYPES[s.type];
@@ -523,10 +568,10 @@ function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
       <Field label="Federal W/H %"><Input value={s.fedWithholdingPct||0} onChange={e => upd("fedWithholdingPct", Number(e.target.value))} type="number" /></Field>
       <Field label="State W/H %"><Input value={s.stateWithholdingPct||0} onChange={e => upd("stateWithholdingPct", Number(e.target.value))} type="number" /></Field>
     </div>
-    <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:12, color:C.textDim, cursor:"pointer" }}>
-      <input type="checkbox" checked={s.pteElection||false} onChange={e => upd("pteElection", e.target.checked)} />
-      {"PTE/SALT workaround (entity-level state tax payment)"}
-    </label>
+    {/* Show note if entity has PTE election */}
+    {(() => { const ent = (entities||[]).find(e => e.label === s.entity); return ent?.pteElection ? <div style={{ fontSize:10, color:C.accent, background:C.accent+"08", padding:"6px 10px", borderRadius:4 }}>
+      {"PTE election active on "}{ent.label}{" at "}{ent.pteRate}{"% ("}{ent.pteState||"CA"}{")"}{" - state tax handled at entity level"}
+    </div> : null; })()}
     {(s.fedWithholdingPct > 0 || s.stateWithholdingPct > 0) && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
       <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
         <span>{"Gross Annual"}</span><span style={{ fontFamily:"'IBM Plex Mono',monospace" }}>{fmtD(s.amount||0, true)}</span>
@@ -967,7 +1012,6 @@ function IncomeTab({ streams, assets, onEdit, onAdd, onDelete }) {
               <Badge color={t?.color}>{CHARS[t?.char]?.short || t?.char}</Badge>
               <Badge color={C.textDim}>{s.timing}</Badge>
               {wPct > 0 && <Badge color={C.orange}>{wPct.toFixed(0)}% W/H</Badge>}
-              {s.pteElection && <Badge color={C.purple}>PTE</Badge>}
               {s.qbi && <Badge color={C.teal}>QBI</Badge>}
               <span style={{ fontSize: 10, color: C.textMuted }}>{s.entity}</span>
             </div>
@@ -1281,6 +1325,13 @@ function EntitiesTab({ entities, setEntities }) {
           </div>
           <div style={{ fontSize: 13, color: C.text, marginBottom: 4 }}>{e.label}</div>
           <div style={{ fontSize: 10, color: C.textMuted }}>{e.filing}</div>
+          {e.pteElection && <div style={{ marginTop:4, display:"flex", gap:4 }}>
+            <Badge color={C.accent}>PTE {e.pteRate}% {e.pteState||""}</Badge>
+          </div>}
+          {((e.retirementContrib||0)>0 || (e.healthInsurance||0)>0) && <div style={{ marginTop:3, display:"flex", gap:4, flexWrap:"wrap" }}>
+            {(e.retirementContrib||0)>0 && <Badge color={C.blue}>{fmtD(e.retirementContrib,true)} retire</Badge>}
+            {(e.healthInsurance||0)>0 && <Badge color={C.teal}>{fmtD(e.healthInsurance,true)} health</Badge>}
+          </div>}
           {e.ownedBy && <div style={{ fontSize: 10, color: C.textDim, marginTop: 4 }}>
             Owned by: {entities.find(x => x.id === e.ownedBy)?.label || "—"} ({e.ownershipPct}%)
           </div>}
@@ -1289,9 +1340,23 @@ function EntitiesTab({ entities, setEntities }) {
               <Field label="Name"><Input value={e.label} onChange={ev => updEntity(e.id, "label", ev.target.value)} /></Field>
               <Field label="Owned By">
                 <Select value={e.ownedBy} onChange={ev => updEntity(e.id, "ownedBy", ev.target.value)}
-                  options={[{ value: "", label: "— Top-level —" }, ...entities.filter(x => x.id !== e.id).map(x => ({ value: x.id, label: x.label }))]} />
+                  options={[{ value: "", label: "-- Top-level --" }, ...entities.filter(x => x.id !== e.id).map(x => ({ value: x.id, label: x.label }))]} />
               </Field>
               <Field label="Ownership %"><Input value={e.ownershipPct} onChange={ev => updEntity(e.id, "ownershipPct", Number(ev.target.value))} type="number" /></Field>
+              {/* Partnership tax properties */}
+              <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:8, marginTop:4 }}>
+                {"Partnership / Entity Tax"}
+              </div>
+              <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:12, color:C.textDim, cursor:"pointer" }}>
+                <input type="checkbox" checked={e.pteElection||false} onChange={ev => updEntity(e.id, "pteElection", ev.target.checked)} />
+                {"PTE / SALT workaround election"}
+              </label>
+              {e.pteElection && <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
+                <Field label="PTE Rate %"><Input value={e.pteRate||0} onChange={ev => updEntity(e.id, "pteRate", Number(ev.target.value))} type="number" /></Field>
+                <Field label="PTE State"><Input value={e.pteState||""} onChange={ev => updEntity(e.id, "pteState", ev.target.value)} /></Field>
+              </div>}
+              <Field label="Retirement Contributions (annual)"><Input value={e.retirementContrib||0} onChange={ev => updEntity(e.id, "retirementContrib", Number(ev.target.value))} type="number" prefix="$" /></Field>
+              <Field label="Health Insurance (annual, deductible)"><Input value={e.healthInsurance||0} onChange={ev => updEntity(e.id, "healthInsurance", Number(ev.target.value))} type="number" prefix="$" /></Field>
               <Field label="Notes"><Input value={e.notes} onChange={ev => updEntity(e.id, "notes", ev.target.value)} placeholder="Filing notes, EIN, etc." /></Field>
               <Btn variant="danger" onClick={() => delEntity(e.id)} style={{ marginTop: 4 }}>Delete Entity</Btn>
             </div>
@@ -1338,19 +1403,53 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
           <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:row.bold?14:12, color:row.c }}>{fmtD(row.v, true)}</span>
         </div>
       ))}
-      <div style={{ borderTop:`1px solid ${C.border}`, marginTop:8, paddingTop:8, display:"flex", justifyContent:"space-between" }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"State Tax"}</span>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.red }}>{fmtD(result.stateTax, true)}</span>
-      </div>
-      <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"Less: State Withholding"}</span>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>({fmtD(result.totalStateWithholding, true)})</span>
-      </div>
-      <div style={{ display:"flex", justifyContent:"space-between", borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
-        <span style={{ fontSize:12, color:C.text }}>{"State Balance Due"}</span>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:14, color:result.balanceDueState>0?C.red:C.green }}>{fmtD(result.balanceDueState, true)}</span>
+      <div style={{ borderTop:`1px solid ${C.border}`, marginTop:8, paddingTop:8 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"State Tax (gross)"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.red }}>{fmtD(result.stateTax, true)}</span>
+        </div>
+        {result.totalPTET > 0 && <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"Less: PTE Credit"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>({fmtD(result.totalPTET, true)})</span>
+        </div>}
+        <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"Less: State Withholding"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>({fmtD(result.totalStateWithholding, true)})</span>
+        </div>
+        <div style={{ display:"flex", justifyContent:"space-between", borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
+          <span style={{ fontSize:12, color:C.text }}>{"State Balance Due"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:14, color:result.balanceDueState>0?C.red:C.green }}>{fmtD(result.balanceDueState, true)}</span>
+        </div>
       </div>
     </Card>
+
+    {/* Entity-Level Deductions */}
+    {(result.totalPTET > 0 || result.totalRetirement > 0 || result.totalHealthIns > 0) && <Card style={{ padding:"16px 20px" }}>
+      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Entity-Level Pre-Tax Deductions"}</div>
+      {result.pteDetails.map((d,i) => (
+        <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"PTE ("}{d.entity}{" - "}{d.rate}{"% "}{d.state}{")"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.accent }}>{fmtD(d.amount, true)}</span>
+        </div>
+      ))}
+      {result.totalRetirement > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+        <span style={{ fontSize:11, color:C.textDim }}>{"Retirement Contributions (401k + PS + DB)"}</span>
+        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.blue }}>{fmtD(result.totalRetirement, true)}</span>
+      </div>}
+      {result.totalHealthIns > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+        <span style={{ fontSize:11, color:C.textDim }}>{"Self-Employed Health Insurance"}</span>
+        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.teal }}>{fmtD(result.totalHealthIns, true)}</span>
+      </div>}
+      <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
+        <div style={{ display:"flex", justifyContent:"space-between" }}>
+          <span style={{ fontSize:12, color:C.text }}>{"Total Pre-Tax Deductions"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.accent }}>{fmtD(result.preTaxDeductions + result.totalHealthIns, true)}</span>
+        </div>
+        {result.pteFedSavings > 0 && <div style={{ fontSize:10, color:C.green, marginTop:4 }}>
+          {"SALT workaround federal savings: ~"}{fmtD(result.pteFedSavings, true)}{" (PTET deducted at entity level, bypasses $10K SALT cap)"}
+        </div>}
+      </div>
+    </Card>}
 
     {/* Withholding Sources */}
     {withheldStreams.length > 0 && <Card style={{ padding:"16px 20px" }}>
@@ -1361,7 +1460,7 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
         return <div key={s.id} style={{ display:"flex", justifyContent:"space-between", alignItems:"center", padding:"6px 0", borderBottom:`1px solid ${C.border}` }}>
           <div style={{ flex:1 }}>
             <div style={{ fontSize:11, color:C.text }}>{s.label}</div>
-            <div style={{ fontSize:10, color:C.textMuted }}>{fmtD(s.amount,true)} gross{s.pteElection?" (PTE election)":""}</div>
+            <div style={{ fontSize:10, color:C.textMuted }}>{fmtD(s.amount,true)} gross</div>
           </div>
           <div style={{ textAlign:"right", fontSize:11, fontFamily:"'IBM Plex Mono',monospace" }}>
             <div style={{ color:C.orange }}>Fed: {fmtD(fedW,true)} ({s.fedWithholdingPct}%)</div>
@@ -1426,7 +1525,7 @@ const PRELOAD_PROFILE = {
 
 const PRELOAD_STREAMS = [
   { id:"s1", type:"k1_guaranteed", label:"K-1 Guaranteed Payment - Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"Husband", qbi:false,
-    fedWithholdingPct:37, stateWithholdingPct:13.3, pteElection:true },
+    fedWithholdingPct:0, stateWithholdingPct:0 },
   { id:"s2", type:"k1_ordinary", label:"K-1 Ordinary - Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
   { id:"s3", type:"k1_ltcg", label:"K-1 LTCG - Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
@@ -1469,10 +1568,24 @@ const PRELOAD_DEDUCTIONS = [
 ];
 
 const PRELOAD_ENTITIES = [
-  { id: "e1", label: "Husband", type: "individual", filing: "1040 (MFJ)", color: C.gold, ownedBy: "", ownershipPct: 100, notes: "Partner, BigLaw Test LLP - San Francisco office" },
-  { id: "e2", label: "Wife", type: "individual", filing: "1040 (MFJ)", color: C.blue, ownedBy: "", ownershipPct: 100, notes: "Spouse" },
-  { id: "e3", label: "Test Family Trust", type: "revTrust", filing: "Grantor -> 1040", color: C.purple, ownedBy: "", ownershipPct: 100, notes: "Joint revocable trust - holds PE + Delphi Plus allocations" },
-  { id: "e4", label: "Test RE Holdings LLC", type: "llcDisregard", filing: "Sch E -> 1040", color: C.teal, ownedBy: "e3", ownershipPct: 100, notes: "Holds Pacific Heights duplex - disregarded entity" },
+  { id:"e1", label:"Husband", type:"individual", filing:"1040 (MFJ)", color:C.gold, ownedBy:"", ownershipPct:100,
+    notes:"Partner, BigLaw Test LLP - San Francisco office",
+    // Partnership tax properties
+    pteElection:true, pteRate:9.3, pteState:"CA",
+    retirementContrib:138000, healthInsurance:47000,
+  },
+  { id:"e2", label:"Wife", type:"individual", filing:"1040 (MFJ)", color:C.blue, ownedBy:"", ownershipPct:100,
+    notes:"Spouse",
+    pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
+  },
+  { id:"e3", label:"Test Family Trust", type:"revTrust", filing:"Grantor -> 1040", color:C.purple, ownedBy:"", ownershipPct:100,
+    notes:"Joint revocable trust - holds PE + Delphi Plus allocations",
+    pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
+  },
+  { id:"e4", label:"Test RE Holdings LLC", type:"llcDisregard", filing:"Sch E -> 1040", color:C.teal, ownedBy:"e3", ownershipPct:100,
+    notes:"Holds Pacific Heights duplex - disregarded entity",
+    pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
+  },
 ];
 
 // ─── PERSONA PRESETS ────────────────────────────────────────────────────────
@@ -1529,7 +1642,7 @@ export default function YosemitePlatform() {
   const [panel, setPanel] = useState(null);
 
   const updProfile = (k, v) => setProfile(p => ({ ...p, [k]: v }));
-  const result = useMemo(() => computeTax(profile, streams, assets, deductions), [profile, streams, assets, deductions]);
+  const result = useMemo(() => computeTax(profile, streams, assets, deductions, entities), [profile, streams, assets, deductions, entities]);
   const bs = useMemo(() => computeBalanceSheet(assets), [assets]);
 
   const saveStream = (s) => { setStreams(p => p.find(x => x.id === s.id) ? p.map(x => x.id === s.id ? s : x) : [...p, s]); setPanel(null); };
