@@ -165,11 +165,18 @@ function computeTax(profile, streams, assets, deductions) {
     totalStateWithholding += a * (s.stateWithholdingPct||0) / 100;
   });
 
-  // From assets (fund interests generate recognized income)
+  // From assets — all asset types that generate income
   let invDistributions=0, invCapCalls=0;
   assets.forEach(item => {
     const at = item.assetType;
-    if (at==="hedgeFund" || at==="peFund") {
+    if (at==="cash") {
+      // Cash/money market → interest income (ordinary investment)
+      ordInv += (item.value||0) * (item.yieldPct||0) / 100;
+    } else if (at==="security") {
+      // Public securities → qualified dividends + realized gains
+      qualDiv += (item.value||0) * (item.divYieldPct||0) / 100;
+      ltcg += (item.value||0) * (item.realizedGainPct||0) / 100;
+    } else if (at==="hedgeFund" || at==="peFund") {
       const nav = item.nav || 0;
       ordInv     += nav * (item.ordPct || 0) / 100;
       stcg       += nav * (item.stcgPct || 0) / 100;
@@ -587,9 +594,18 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
     </Field>
 
     {/* Cash */}
-    {a.assetType==="cash" && <Field label="Balance">
-      <Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" />
-    </Field>}
+    {a.assetType==="cash" && <>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+        <Field label="Balance"><Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Yield %"><Input value={a.yieldPct||0} onChange={e => upd("yieldPct", Number(e.target.value))} type="number" /></Field>
+      </div>
+      {(a.yieldPct||0) > 0 && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
+          <span>{"Annual Interest (Ord. Investment)"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.cyan }}>{fmtD((a.value||0)*(a.yieldPct||0)/100, true)}</span>
+        </div>
+      </div>}
+    </>}
 
     {/* Securities */}
     {a.assetType==="security" && <>
@@ -597,7 +613,21 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
         <Field label="Current Value"><Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
         <Field label="Cost Basis"><Input value={a.costBasis||0} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
       </div>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+        <Field label="Dividend Yield %"><Input value={a.divYieldPct||0} onChange={e => upd("divYieldPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Est. Realized Gain %"><Input value={a.realizedGainPct||0} onChange={e => upd("realizedGainPct", Number(e.target.value))} type="number" /></Field>
+      </div>
       {gain > 0 && <div style={{ fontSize:11, color:C.orange }}>{"Embedded gain: "}{fmtD(gain, true)}</div>}
+      {((a.divYieldPct||0) > 0 || (a.realizedGainPct||0) !== 0) && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
+        {(a.divYieldPct||0) > 0 && <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
+          <span>{"Qualified Dividends"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.green }}>{fmtD((a.value||0)*(a.divYieldPct||0)/100, true)}</span>
+        </div>}
+        {(a.realizedGainPct||0) !== 0 && <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim, marginTop:3 }}>
+          <span>{"Est. Realized LTCG"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:(a.realizedGainPct||0)>=0?C.green:C.red }}>{fmtD((a.value||0)*(a.realizedGainPct||0)/100, true)}</span>
+        </div>}
+      </div>}
     </>}
 
     {/* Fund interests (HF + PE) */}
@@ -995,6 +1025,9 @@ function BalanceSheetTab({ assets, bs, onEdit, onAdd, onDelete }) {
           const basis = isFund ? (a.adjBasis||a.costBasis||0) : (a.costBasis||val);
           const gain = val - basis;
           const recog = isFund ? ((a.ordPct||0)+(a.stcgPct||0)+(a.ltcgPct||0)+(a.qualDivPct||0)+(a.intPct||0)+(a.taxExPct||0)) : 0;
+          const annualIncome = a.assetType==="cash" ? (a.value||0)*(a.yieldPct||0)/100
+            : a.assetType==="security" ? (a.value||0)*((a.divYieldPct||0)+(a.realizedGainPct||0))/100
+            : isFund ? val*recog/100 : 0;
           return (
             <Card key={a.id} style={{ padding:"12px 16px", cursor:"pointer", marginBottom:4 }}
               onClick={() => onEdit(a)}
@@ -1005,6 +1038,8 @@ function BalanceSheetTab({ assets, bs, onEdit, onAdd, onDelete }) {
                 <div style={{ flex:1 }}>
                   <div style={{ fontSize:12, color:C.text }}>{a.label}</div>
                   <div style={{ display:"flex", gap:6, marginTop:2, flexWrap:"wrap" }}>
+                    {a.assetType==="cash" && (a.yieldPct||0)>0 && <Badge color={C.cyan}>{a.yieldPct}% yield</Badge>}
+                    {a.assetType==="security" && (a.divYieldPct||0)>0 && <Badge color={C.green}>{a.divYieldPct}% div</Badge>}
                     {isFund && recog!==0 && <Badge color={recog>=0?C.text:C.green}>{recog.toFixed(1)}% recog</Badge>}
                     {isFund && (a.totalReturnPct||0)>0 && <Badge color={C.textDim}>{a.totalReturnPct}% return</Badge>}
                     {(a.unfunded||0)>0 && <Badge color={C.orange}>{fmtD(a.unfunded,true)} unfunded</Badge>}
@@ -1013,7 +1048,8 @@ function BalanceSheetTab({ assets, bs, onEdit, onAdd, onDelete }) {
                 </div>
                 <div style={{ textAlign:"right", flexShrink:0 }}>
                   <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.text }}>{fmtD(val, true)}</div>
-                  {gain!==0 && basis>0 && <div style={{ fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:gain>0?C.orange:C.green }}>{fmtD(gain, true)} gain</div>}
+                  {annualIncome!==0 && <div style={{ fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:annualIncome>0?C.cyan:C.green }}>{fmtD(annualIncome, true)}/yr</div>}
+                  {gain!==0 && basis>0 && basis!==val && <div style={{ fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:gain>0?C.orange:C.green }}>{fmtD(gain, true)} gain</div>}
                   {(a.mortgage||0)>0 && <div style={{ fontSize:10, color:C.red }}>{"Mtg: "}{fmtD(a.mortgage, true)}</div>}
                 </div>
                 <Btn variant="ghost" onClick={e => { e.stopPropagation(); onDelete(a.id); }} style={{ fontSize:10, padding:"3px 8px", color:C.red }}>{"x"}</Btn>
@@ -1339,16 +1375,14 @@ const PRELOAD_STREAMS = [
     fedWithholdingPct:0, stateWithholdingPct:0 },
   { id:"s4", type:"rental", label:"Net Rental Income - Pacific Heights Duplex", amount:72000, timing:"monthly", entity:"Test RE Holdings LLC", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s5", type:"interest", label:"Money Market / T-Bill Interest", amount:85000, timing:"monthly", entity:"Husband", qbi:false,
-    fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
 const PRELOAD_ASSETS = [
   // Cash (Tier 1)
-  {id:"a1",assetType:"cash",label:"Schwab Checking + Money Market",value:920000,entity:"Husband"},
-  {id:"a2",assetType:"cash",label:"Operating Cash - RE LLC",value:45000,entity:"Test RE Holdings LLC"},
+  {id:"a1",assetType:"cash",label:"Schwab Checking + Money Market",value:920000,yieldPct:4.8,entity:"Husband"},
+  {id:"a2",assetType:"cash",label:"Operating Cash - RE LLC",value:45000,yieldPct:0,entity:"Test RE Holdings LLC"},
   // Securities (Tier 2)
-  {id:"a3",assetType:"security",label:"Direct Equity Portfolio (Schwab)",value:1800000,costBasis:1200000,entity:"Test Family Trust"},
+  {id:"a3",assetType:"security",label:"Direct Equity Portfolio (Schwab)",value:1800000,costBasis:1200000,divYieldPct:1.4,realizedGainPct:0,entity:"Test Family Trust"},
   // Hedge Funds (Tier 3)
   {id:"a4",assetType:"hedgeFund",label:"AQR Tax-Aware Delphi Plus Fund",nav:5400000,costBasis:4900000,adjBasis:4500000,unfunded:0,
     totalReturnPct:12,mgmtFee:2.0,perfFee:20,ordPct:-30,stcgPct:0,ltcgPct:25,qualDivPct:5,intPct:0,taxExPct:0,
