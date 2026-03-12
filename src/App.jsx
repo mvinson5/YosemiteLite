@@ -889,37 +889,65 @@ function OverviewTab({ profile, result, streams, assets, updProfile, bs }) {
 }
 
 // ─── INCOME TAB ─────────────────────────────────────────────────────────────
-function IncomeTab({ streams, onEdit, onAdd, onDelete }) {
+function IncomeTab({ streams, assets, onEdit, onAdd, onDelete }) {
+  // Stream-only totals
   const totalOrd = streams.filter(s => {const c=INCOME_TYPES[s.type]?.char; return c==="ordEarned"||c==="ordInv";}).reduce((t, s) => t + s.amount, 0);
   const totalSTCG = streams.filter(s => INCOME_TYPES[s.type]?.char === "stcg").reduce((t, s) => t + s.amount, 0);
   const totalLTCG = streams.filter(s => {const c=INCOME_TYPES[s.type]?.char; return c==="ltcg"||c==="qualDiv";}).reduce((t, s) => t + s.amount, 0);
   const totalPassive = streams.filter(s => INCOME_TYPES[s.type]?.char === "passive").reduce((t, s) => t + s.amount, 0);
 
+  // Asset-derived income
+  const assetIncome = (assets||[]).map(a => {
+    const at = a.assetType;
+    const items = [];
+    if (at==="cash" && (a.yieldPct||0)>0) {
+      items.push({label:a.label, char:"ordInv", charLabel:"Interest", amount:(a.value||0)*(a.yieldPct||0)/100, detail:`${a.yieldPct}% yield on ${fmtD(a.value||0,true)}`});
+    } else if (at==="security") {
+      if ((a.divYieldPct||0)>0) items.push({label:a.label, char:"qualDiv", charLabel:"Qual. Dividends", amount:(a.value||0)*(a.divYieldPct||0)/100, detail:`${a.divYieldPct}% yield`});
+      if ((a.realizedGainPct||0)!==0) items.push({label:a.label, char:"ltcg", charLabel:"Realized LTCG", amount:(a.value||0)*(a.realizedGainPct||0)/100, detail:`${a.realizedGainPct}% realized`});
+    } else if (at==="hedgeFund"||at==="peFund") {
+      const nav=a.nav||0;
+      const ord=nav*(a.ordPct||0)/100 + nav*(a.intPct||0)/100;
+      const st=nav*(a.stcgPct||0)/100;
+      const lt=nav*(a.ltcgPct||0)/100;
+      const qd=nav*(a.qualDivPct||0)/100;
+      const te=nav*(a.taxExPct||0)/100;
+      if (ord!==0) items.push({label:a.label, char:"ordInv", charLabel:"Ordinary", amount:ord, detail:`${a.ordPct||0}% ord + ${a.intPct||0}% int`});
+      if (st!==0) items.push({label:a.label, char:"stcg", charLabel:"STCG", amount:st, detail:`${a.stcgPct}%`});
+      if (lt!==0) items.push({label:a.label, char:"ltcg", charLabel:"LTCG", amount:lt, detail:`${a.ltcgPct}%`});
+      if (qd!==0) items.push({label:a.label, char:"qualDiv", charLabel:"Qual. Div", amount:qd, detail:`${a.qualDivPct}%`});
+      if (te!==0) items.push({label:a.label, char:"taxExempt", charLabel:"Tax-Exempt", amount:te, detail:`${a.taxExPct}%`});
+    }
+    return items;
+  }).flat();
+
+  const assetOrdInv = assetIncome.filter(i=>i.char==="ordInv").reduce((t,i)=>t+i.amount,0);
+  const assetSTCG = assetIncome.filter(i=>i.char==="stcg").reduce((t,i)=>t+i.amount,0);
+  const assetLTCG = assetIncome.filter(i=>i.char==="ltcg"||i.char==="qualDiv").reduce((t,i)=>t+i.amount,0);
+  const assetTaxEx = assetIncome.filter(i=>i.char==="taxExempt").reduce((t,i)=>t+i.amount,0);
+
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-      <SectionHeader sub={`${streams.length} income streams configured`}>Income Stream Registry</SectionHeader>
-      <Btn variant="gold" onClick={onAdd}>+ Add Income</Btn>
+      <SectionHeader sub={`${streams.length} streams + ${assetIncome.length} asset-derived items`}>{"Income Registry"}</SectionHeader>
+      <Btn variant="gold" onClick={onAdd}>{"+ Add Income"}</Btn>
     </div>
-    {/* Summary badges */}
+    {/* Combined summary badges */}
     <div style={{ display: "flex", gap: 12 }}>
-      <Card style={{ padding: "14px 18px", flex: 1 }}>
-        <div style={{ fontSize: 9, color: C.textMuted, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Ordinary</div>
-        <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 18, color: C.blue }}>{fmtD(totalOrd, true)}</div>
-      </Card>
-      <Card style={{ padding: "14px 18px", flex: 1 }}>
-        <div style={{ fontSize: 9, color: C.textMuted, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>STCG</div>
-        <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 18, color: C.orange }}>{fmtD(totalSTCG, true)}</div>
-      </Card>
-      <Card style={{ padding: "14px 18px", flex: 1 }}>
-        <div style={{ fontSize: 9, color: C.textMuted, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>{"LTCG / QDiv"}</div>
-        <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 18, color: C.green }}>{fmtD(totalLTCG, true)}</div>
-      </Card>
-      <Card style={{ padding: "14px 18px", flex: 1 }}>
-        <div style={{ fontSize: 9, color: C.textMuted, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Passive</div>
-        <div style={{ fontFamily: "'IBM Plex Mono',monospace", fontSize: 18, color: C.purple }}>{fmtD(totalPassive, true)}</div>
-      </Card>
+      {[
+        {l:"Ordinary",v:totalOrd+assetOrdInv,c:C.blue},
+        {l:"STCG",v:totalSTCG+assetSTCG,c:C.orange},
+        {l:"LTCG / QDiv",v:totalLTCG+assetLTCG,c:C.green},
+        {l:"Passive",v:totalPassive,c:C.purple},
+        ...(assetTaxEx!==0?[{l:"Tax-Exempt",v:assetTaxEx,c:C.teal}]:[]),
+      ].map((x,i) => (
+        <Card key={i} style={{ padding:"14px 18px", flex:1 }}>
+          <div style={{ fontSize:9, color:C.textMuted, letterSpacing:"0.15em", textTransform:"uppercase", marginBottom:6 }}>{x.l}</div>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:18, color:x.c }}>{fmtD(x.v, true)}</div>
+        </Card>
+      ))}
     </div>
-    {/* Stream list */}
+    {/* Earned / standalone streams */}
+    <SectionHeader sub="Earned income, partnership allocations, and other non-asset income">{"Income Streams"}</SectionHeader>
     {streams.length === 0 && <Card style={{ padding: 40, textAlign: "center" }}>
       <div style={{ fontSize: 13, color: C.textMuted }}>No income streams configured. Add W-2, K-1, rental, or other income sources.</div>
     </Card>}
@@ -956,6 +984,36 @@ function IncomeTab({ streams, onEdit, onAdd, onDelete }) {
         </div>
       </Card>;
     })}
+    {/* Asset-derived income */}
+    <SectionHeader sub="Income generated by balance sheet assets (edit on Balance Sheet tab)">{"Asset-Derived Income"}</SectionHeader>
+    <Card style={{ padding:"16px 20px" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+        <thead>
+          <tr style={{ borderBottom:`1px solid ${C.borderLight}` }}>
+            {["Source","Character","Detail","Annual"].map(h =>
+              <th key={h} style={{ textAlign:h==="Annual"?"right":"left", padding:"6px 4px", fontSize:8, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
+            )}
+          </tr>
+        </thead>
+        <tbody>
+          {assetIncome.map((item,i) => (
+            <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
+              <td style={{ padding:"7px 4px", color:C.text, fontSize:11 }}>{item.label}</td>
+              <td style={{ padding:"7px 4px" }}><Badge color={CHARS[item.char]?.color||C.textDim}>{item.charLabel}</Badge></td>
+              <td style={{ padding:"7px 4px", color:C.textDim, fontSize:10 }}>{item.detail}</td>
+              <td style={{ padding:"7px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", color:item.amount>=0?C.text:C.green }}>{fmtD(item.amount, true)}</td>
+            </tr>
+          ))}
+          {assetIncome.length === 0 && <tr><td colSpan={4} style={{ padding:20, textAlign:"center", color:C.textMuted }}>No asset-derived income. Add yields on Balance Sheet tab.</td></tr>}
+          <tr style={{ borderTop:`2px solid ${C.border}` }}>
+            <td colSpan={3} style={{ padding:"8px 4px", fontSize:12, color:C.text, fontWeight:500 }}>{"Total Asset-Derived"}</td>
+            <td style={{ padding:"8px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.accent }}>
+              {fmtD(assetIncome.reduce((t,i)=>t+i.amount,0), true)}
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </Card>
   </div>;
 }
 
@@ -1572,7 +1630,7 @@ export default function YosemitePlatform() {
     <div style={{ flex: 1, overflow: "auto", padding: "24px 28px" }}>
       {tab === "overview" && <OverviewTab profile={profile} result={result} streams={streams} assets={assets} updProfile={updProfile} bs={bs} />}
       {tab === "balsheet" && <BalanceSheetTab assets={assets} bs={bs} onEdit={a => setPanel({type:"asset",data:a})} onAdd={() => setPanel({type:"asset",data:null})} onDelete={delAsset} />}
-      {tab === "income" && <IncomeTab streams={streams} onEdit={s => setPanel({ type: "income", data: s })} onAdd={() => setPanel({ type: "income", data: null })} onDelete={delStream} />}
+      {tab === "income" && <IncomeTab streams={streams} assets={assets} onEdit={s => setPanel({ type: "income", data: s })} onAdd={() => setPanel({ type: "income", data: null })} onDelete={delStream} />}
       {tab === "deductions" && <DeductionsTab deductions={deductions} setDeductions={setDeds} profile={profile} updProfile={updProfile} result={result} />}
       {tab === "cashflow" && <CashFlowTab profile={profile} streams={streams} result={result} />}
       {tab === "entities" && <EntitiesTab entities={entities} setEntities={setEntities} />}
