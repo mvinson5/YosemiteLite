@@ -465,7 +465,7 @@ function SlidePanel({ open, onClose, title, children }) {
 }
 
 // ─── INCOME EDITOR ──────────────────────────────────────────────────────────
-function IncomePanel({ stream, onSave, onDelete, onClose }) {
+function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
   const [s, setS] = useState(stream || {
     id: uid(), type: "w2", label: "", amount: 0, timing: "monthly", timingMonth: 11,
     qbi: false, entity: "",
@@ -505,7 +505,8 @@ function IncomePanel({ stream, onSave, onDelete, onClose }) {
         options={["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].map((m, i) => ({ value: i, label: m }))} />
     </Field>}
     <Field label="Entity / Source">
-      <Input value={s.entity} onChange={e => upd("entity", e.target.value)} placeholder="e.g. Whitmore Family LP" />
+      <Select value={s.entity||""} onChange={e => upd("entity", e.target.value)}
+        options={[{value:"",label:"-- Select Entity --"}, ...(entities||[]).map(e => ({value:e.label,label:e.label}))]} />
     </Field>
     {/* Withholding */}
     <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
@@ -545,7 +546,7 @@ function IncomePanel({ stream, onSave, onDelete, onClose }) {
 }
 
 // ─── UNIFIED ASSET EDITOR ──────────────────────────────────────────────────
-function AssetEditor({ asset, onSave, onDelete }) {
+function AssetEditor({ asset, onSave, onDelete, entities }) {
   const [a, setA] = useState(asset || {
     id:uid(), assetType:"cash", label:"", value:0, nav:0, costBasis:0, adjBasis:0, unfunded:0,
     totalReturnPct:0, mgmtFee:0, perfFee:0,
@@ -580,7 +581,10 @@ function AssetEditor({ asset, onSave, onDelete }) {
         ]} />
     </Field>
     <Field label="Label"><Input value={a.label||""} onChange={e => upd("label", e.target.value)} /></Field>
-    <Field label="Entity"><Input value={a.entity||""} onChange={e => upd("entity", e.target.value)} /></Field>
+    <Field label="Entity">
+      <Select value={a.entity||""} onChange={e => upd("entity", e.target.value)}
+        options={[{value:"",label:"-- Select Entity --"}, ...(entities||[]).map(e => ({value:e.label,label:e.label}))]} />
+    </Field>
 
     {/* Cash */}
     {a.assetType==="cash" && <Field label="Balance">
@@ -1327,15 +1331,15 @@ const PRELOAD_PROFILE = {
 };
 
 const PRELOAD_STREAMS = [
-  { id:"s1", type:"k1_guaranteed", label:"K-1 Guaranteed Payment - Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"BigLaw Test LLP", qbi:false,
+  { id:"s1", type:"k1_guaranteed", label:"K-1 Guaranteed Payment - Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"Husband", qbi:false,
     fedWithholdingPct:37, stateWithholdingPct:13.3, pteElection:true },
-  { id:"s2", type:"k1_ordinary", label:"K-1 Ordinary - Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"BigLaw Test LLP", qbi:false,
+  { id:"s2", type:"k1_ordinary", label:"K-1 Ordinary - Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s3", type:"k1_ltcg", label:"K-1 LTCG - Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"BigLaw Test LLP", qbi:false,
+  { id:"s3", type:"k1_ltcg", label:"K-1 LTCG - Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
   { id:"s4", type:"rental", label:"Net Rental Income - Pacific Heights Duplex", amount:72000, timing:"monthly", entity:"Test RE Holdings LLC", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s5", type:"interest", label:"Money Market / T-Bill Interest", amount:85000, timing:"monthly", entity:"Schwab Brokerage", qbi:false,
+  { id:"s5", type:"interest", label:"Money Market / T-Bill Interest", amount:85000, timing:"monthly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
@@ -1351,7 +1355,7 @@ const PRELOAD_ASSETS = [
     distPct:0,capCallPct:0,entity:"Test Family Trust"},
   {id:"a5",assetType:"hedgeFund",label:"AQR Flex SMA (F250)",nav:3000000,costBasis:2800000,adjBasis:2800000,unfunded:0,
     totalReturnPct:10,mgmtFee:0.55,perfFee:0,ordPct:0,stcgPct:-50,ltcgPct:0,qualDivPct:1,intPct:0,taxExPct:0,
-    distPct:0,capCallPct:0,entity:"Husband - Schwab SMA"},
+    distPct:0,capCallPct:0,entity:"Husband"},
   // PE Funds (Tier 4)
   {id:"a6",assetType:"peFund",label:"Silver Lake Partners VII (Buyout)",nav:2500000,costBasis:2000000,adjBasis:1850000,unfunded:500000,
     totalReturnPct:18,mgmtFee:2.0,perfFee:20,ordPct:-2,stcgPct:0,ltcgPct:8,qualDivPct:0,intPct:0,taxExPct:0,
@@ -1543,10 +1547,10 @@ export default function YosemitePlatform() {
 
     {/* Slide Panels */}
     <SlidePanel open={panel?.type === "income"} onClose={() => setPanel(null)} title={panel?.data ? "Edit Income Stream" : "Add Income Stream"}>
-      <IncomePanel key={panel?.data?.id || "new-income"} stream={panel?.data} onSave={saveStream} onDelete={delStream} onClose={() => setPanel(null)} />
+      <IncomePanel key={panel?.data?.id || "new-income"} stream={panel?.data} onSave={saveStream} onDelete={delStream} onClose={() => setPanel(null)} entities={entities} />
     </SlidePanel>
     <SlidePanel open={panel?.type === "asset"} onClose={() => setPanel(null)} title={panel?.data ? "Edit Asset" : "Add Asset"}>
-      <AssetEditor key={panel?.data?.id || "new-asset"} asset={panel?.data} onSave={saveAsset} onDelete={delAsset} />
+      <AssetEditor key={panel?.data?.id || "new-asset"} asset={panel?.data} onSave={saveAsset} onDelete={delAsset} entities={entities} />
     </SlidePanel>
   </div>;
 }
