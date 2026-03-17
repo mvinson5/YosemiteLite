@@ -64,21 +64,15 @@ const CHARS = {
   taxExempt:{label:"Tax-Exempt",short:"Exempt",color:C.teal},
 };
 const INCOME_TYPES = {
-  w2:           {label:"W-2 Wages / Salary",           char:"ordEarned", color:C.blue,   desc:"Employment wages, bonus, RSU vest"},
-  k1_ordinary:  {label:"K-1 Ordinary Business Income", char:"ordEarned", color:C.blue,   desc:"Partnership ordinary business income"},
-  k1_guaranteed:{label:"K-1 Guaranteed Payment",       char:"ordEarned", color:C.blue,   desc:"Partner draw (BigLaw, PE mgmt fee)"},
-  k1_ord_inv:   {label:"K-1 Ordinary (Investment)",    char:"ordInv",    color:C.cyan,   desc:"Interest, NPC ordinary from fund"},
-  k1_stcg:      {label:"K-1 Short-Term Cap Gain",      char:"stcg",      color:C.orange, desc:"STCG - nets against capital losses first"},
-  k1_ltcg:      {label:"K-1 LTCG / Carried Interest",  char:"ltcg",      color:C.green,  desc:"Fund capital gains, carried interest"},
-  k1_qual_div:  {label:"K-1 Qualified Dividends",      char:"qualDiv",   color:C.green,  desc:"Qualified dividends from pass-through"},
-  rental:       {label:"Net Rental Income",             char:"passive",   color:C.purple, desc:"Net rental income after depreciation"},
-  interest:     {label:"Interest Income",               char:"ordInv",    color:C.cyan,   desc:"Savings, CDs, money market"},
-  qual_div:     {label:"Qualified Dividends (Direct)",  char:"qualDiv",   color:C.green,  desc:"Direct equity dividends"},
-  ord_div:      {label:"Non-Qualified Dividends",       char:"ordInv",    color:C.cyan,   desc:"REIT, money market distributions"},
-  muni_interest:{label:"Municipal Bond Interest",       char:"taxExempt", color:C.teal,   desc:"Tax-exempt muni interest"},
-  other_ord:    {label:"Other Ordinary Income",         char:"ordEarned", color:C.textDim,desc:"Alimony, misc."},
-  other_ltcg:   {label:"Other LTCG",                   char:"ltcg",      color:C.green,  desc:"Direct realized gains"},
-  other_stcg:   {label:"Other STCG",                   char:"stcg",      color:C.orange, desc:"Direct short-term gains/losses"},
+  wages:     {label:"Wages / Salary",          char:"ordEarned", color:C.blue,   desc:"W-2 employment wages, bonus, RSU vest"},
+  business:  {label:"Business Income",         char:"ordEarned", color:C.blue,   desc:"K-1 guaranteed payments, profit allocations, self-employment"},
+  interest:  {label:"Interest Income",         char:"ordInv",    color:C.cyan,   desc:"Savings, CDs, money market, NPC ordinary"},
+  qualDiv:   {label:"Qualified Dividends",     char:"qualDiv",   color:C.green,  desc:"Equity dividends, fund qualified distributions"},
+  nonQualDiv:{label:"Non-Qualified Dividends", char:"ordInv",    color:C.cyan,   desc:"REIT, money market distributions"},
+  stcg:      {label:"Short-Term Capital Gain", char:"stcg",      color:C.orange, desc:"Held under 1 year, nets against losses"},
+  ltcg:      {label:"Long-Term Capital Gain",  char:"ltcg",      color:C.green,  desc:"Held over 1 year, carried interest"},
+  passive:   {label:"Rental / Passive",        char:"passive",   color:C.purple, desc:"Rental income, passive K-1 activities"},
+  taxExempt: {label:"Municipal / Tax-Exempt",  char:"taxExempt", color:C.teal,   desc:"Muni bond interest, exempt income"},
 };
 
 const INVESTMENT_PRESETS = [
@@ -171,9 +165,12 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     // Withholding (stream-level, for W-2 etc.)
     totalFedWithholding += a * (s.fedWithholdingPct||0) / 100;
     totalStateWithholding += a * (s.stateWithholdingPct||0) / 100;
-    // Track K-1 income by entity for PTET
-    if (s.type.startsWith("k1_")) {
-      k1ByEntity[s.entity] = (k1ByEntity[s.entity]||0) + a;
+    // Track income by entity for entity-level deductions (PTET, retirement, health)
+    if (s.entity && entMap[s.entity]) {
+      const ent = entMap[s.entity];
+      if (ent.pteElection || (ent.retirementContrib||0)>0 || (ent.healthInsurance||0)>0) {
+        k1ByEntity[s.entity] = (k1ByEntity[s.entity]||0) + a;
+      }
     }
   });
 
@@ -231,7 +228,22 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   // PTET generates a state tax credit (dollar for dollar)
   // Health insurance is an above-the-line deduction (self-employed health)
 
-  // Step 1c: Liability interest deductions
+  // Step 1c: Approach C — actual distributions vs. gross K-1
+  let totalActualDist=0, totalGrossK1ForDistEnts=0;
+  Object.entries(k1ByEntity).forEach(([entityLabel]) => {
+    const ent = entMap[entityLabel];
+    if (ent?.actualDistributions > 0) {
+      totalActualDist += ent.actualDistributions;
+      totalGrossK1ForDistEnts += k1ByEntity[entityLabel] || 0;
+    }
+  });
+  const entityDeducTotal = totalPTET + totalRetirement + totalHealthIns;
+  const phantomIncome = totalGrossK1ForDistEnts > 0 ? totalGrossK1ForDistEnts - totalActualDist : 0;
+  // firmRetention = what the firm keeps beyond the entity deductions we already model
+  // If actualDist is set, CF should use it instead of gross-minus-deductions
+  const firmRetention = totalActualDist > 0 ? Math.max(0, phantomIncome - entityDeducTotal) : 0;
+
+  // Step 1d: Liability interest deductions
   let schedAInterest=0, totalLiabPayments=0;
   (liabilities||[]).forEach(l => {
     const lpf = proFactor(l);
@@ -332,7 +344,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const grossIncome = agi + taxExempt;
   const netAfterWithholding = grossIncome - totalWithholding;
   const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
-    - totalPTET - totalRetirement - totalHealthIns
+    - totalPTET - totalRetirement - totalHealthIns - firmRetention
     - (profile.livingExpenses||0)*12 - totalLiabPayments
     + invDistributions - invCapCalls + reCashFlow;
 
@@ -355,6 +367,8 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     marginalOrd, marginalPref,
     // Entity-level deductions
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
+    // Approach C: actual distributions
+    totalActualDist, totalGrossK1ForDistEnts, phantomIncome, firmRetention, entityDeducTotal,
     // Withholding
     totalFedWithholding, totalStateWithholding, totalWithholding,
     // Safe harbor
@@ -405,6 +419,9 @@ function computeMonthlyCashflow(profile, streams, assets, result, liabilities) {
   // Entity deductions prorated monthly
   const entityDeducMonthly = ((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)) / 12;
 
+  // Firm retention (Approach C: gap between gross K-1 and actual distributions, beyond entity deductions)
+  const firmRetMonthly = (result.firmRetention||0) / 12;
+
   // Liability payments per month (with proration)
   const liabMonthly = (liabilities||[]).reduce((t,l) => t + (isActiveInMonth(l,0) ? (l.monthlyPayment||0) : 0), 0);
 
@@ -441,11 +458,11 @@ function computeMonthlyCashflow(profile, streams, assets, result, liabilities) {
     let liabPmt = 0;
     (liabilities||[]).forEach(l => { if (isActiveInMonth(l, i)) liabPmt += (l.monthlyPayment||0); });
 
-    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entityDeducMonthly;
+    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entityDeducMonthly - firmRetMonthly;
     cumulative += net;
 
     return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, liabPmt,
-      capCall, entityDeduc:entityDeducMonthly,
+      capCall, entityDeduc:entityDeducMonthly, firmRet:firmRetMonthly,
       net, cumulative, qDue:qDue[i] };
   });
 }
@@ -594,7 +611,7 @@ function SlidePanel({ open, onClose, title, children }) {
 // ─── INCOME EDITOR ──────────────────────────────────────────────────────────
 function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
   const [s, setS] = useState(stream || {
-    id: uid(), type: "w2", label: "", amount: 0, timing: "monthly", timingMonth: 11,
+    id: uid(), type: "wages", label: "", amount: 0, timing: "monthly", timingMonth: 11,
     qbi: false, entity: "",
     fedWithholdingPct: 0, stateWithholdingPct: 0, startMonth: 0, endMonth: 11,
   });
@@ -947,6 +964,26 @@ function OverviewTab({ profile, result, streams, assets, updProfile, bs }) {
         </div>
       </Card>}
     </div>}
+
+    {/* Phantom Income Alert */}
+    {result.phantomIncome > 0 && <Card style={{ padding:"16px 20px", background:C.red+"06", borderColor:C.red+"30" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div>
+          <div style={{ fontSize:9, letterSpacing:"0.15em", textTransform:"uppercase", color:C.red, marginBottom:4 }}>{"Phantom Income"}</div>
+          <div style={{ fontSize:11, color:C.textDim }}>
+            {"K-1 taxable: "}{fmtD(result.totalGrossK1ForDistEnts, true)}
+            {" | Actual distributions: "}{fmtD(result.totalActualDist, true)}
+          </div>
+          <div style={{ fontSize:10, color:C.textMuted, marginTop:4 }}>
+            {"You owe tax on "}{fmtD(result.phantomIncome, true)}{" of income retained by the firm (PTET, retirement, capital, holdback)."}
+          </div>
+        </div>
+        <div style={{ textAlign:"right", flexShrink:0 }}>
+          <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:28, color:C.red, fontWeight:600 }}>{fmtD(result.phantomIncome, true)}</div>
+          <div style={{ fontSize:10, color:C.textMuted }}>retained by firm</div>
+        </div>
+      </div>
+    </Card>}
 
     {/* Schedule D Netting Summary */}
     {(result.netST !== 0 || result.netLT !== 0) && <Card style={{ padding: "14px 18px" }}>
@@ -1349,7 +1386,7 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result,
 
 function CashFlowTab({ profile, streams, result, liabilities }) {
   const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, [], result, liabilities), [profile, streams, result, liabilities]);
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.withholding+m.entityDeduc)));
+  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.withholding+m.entityDeduc+m.firmRet)));
   const barH = 140;
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -1359,6 +1396,7 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
       {[
         {l:"Gross Income",v:monthly.reduce((t,m)=>t+m.grossIn,0),c:C.text},
         {l:"Entity Deductions",v:(result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0),c:C.accent},
+        ...(result.firmRetention>0?[{l:"Firm Retention",v:result.firmRetention,c:C.red}]:[]),
         {l:"Withholding",v:result.totalWithholding,c:C.orange},
         {l:"Est. Tax Pmts",v:result.totalEstPaid,c:C.red},
         {l:"Net Deposits",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:C.green},
@@ -1382,7 +1420,7 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
     {/* Bar chart */}
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liabilities",c:C.blue},{l:"Cap Calls",c:C.purple}]
+        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"Firm Ret.",c:C.red+"88"},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liab.",c:C.blue},{l:"Cap Calls",c:C.purple}]
           .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:C.textMuted }}>
             <div style={{ width:8, height:8, borderRadius:2, background:x.c }} />{x.l}
           </div>)}
@@ -1391,6 +1429,7 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
         {monthly.map((m, i) => {
           const incH = maxVal>0 ? (m.cashIn/maxVal)*barH : 0;
           const entH = maxVal>0 ? (m.entityDeduc/maxVal)*barH : 0;
+          const frH = maxVal>0 ? (m.firmRet/maxVal)*barH : 0;
           const whH = maxVal>0 ? (m.withholding/maxVal)*barH : 0;
           const taxH = maxVal>0 ? (m.estPmt/maxVal)*barH : 0;
           const expH = maxVal>0 ? (m.livingExp/maxVal)*barH : 0;
@@ -1402,6 +1441,7 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
             <div style={{ width:"100%", display:"flex", flexDirection:"column", gap:1 }}>
               <div style={{ height:incH, background:C.green+"88", borderRadius:"3px 3px 0 0", minHeight:incH>0?2:0 }} />
               <div style={{ height:entH, background:C.accent+"66", minHeight:entH>0?2:0 }} />
+              {frH > 0 && <div style={{ height:frH, background:C.red+"44", minHeight:2 }} />}
               <div style={{ height:whH, background:C.orange+"66", minHeight:whH>0?2:0 }} />
               <div style={{ height:taxH, background:C.red+"88", minHeight:taxH>0?2:0 }} />
               <div style={{ height:expH, background:C.textDim+"44", minHeight:expH>0?2:0 }} />
@@ -1421,7 +1461,7 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${C.borderLight}` }}>
-            {["Month","Gross In","W/H","Ent. Ded","Net In","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
+            {["Month","Gross In","W/H","Ent. Ded","Firm Ret","Net In","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
               <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:7, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
             )}
           </tr>
@@ -1430,9 +1470,9 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
           {monthly.map((m,i) => (
             <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
               <td style={{ padding:"6px 4px", color:C.text, fontSize:11 }}>{m.month}{m.qDue ? <span style={{ fontSize:8, color:C.red, marginLeft:3 }}>({m.qDue})</span> : ""}</td>
-              {[m.grossIn, m.withholding, m.entityDeduc, m.cashIn - m.entityDeduc, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
+              {[m.grossIn, m.withholding, m.entityDeduc, m.firmRet, m.cashIn - m.entityDeduc - m.firmRet, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
                 <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10,
-                  color: j===1?C.orange : j===2?C.accent : j>=8?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
+                  color: j===1?C.orange : j===2?C.accent : j===3?C.red : j>=9?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
               )}
             </tr>
           ))}
@@ -1482,6 +1522,7 @@ function EntitiesTab({ entities, setEntities }) {
           {((e.retirementContrib||0)>0 || (e.healthInsurance||0)>0) && <div style={{ marginTop:3, display:"flex", gap:4, flexWrap:"wrap" }}>
             {(e.retirementContrib||0)>0 && <Badge color={C.blue}>{fmtD(e.retirementContrib,true)} retire</Badge>}
             {(e.healthInsurance||0)>0 && <Badge color={C.teal}>{fmtD(e.healthInsurance,true)} health</Badge>}
+            {(e.actualDistributions||0)>0 && <Badge color={C.green}>{fmtD(e.actualDistributions,true)} dist</Badge>}
           </div>}
           {e.ownedBy && <div style={{ fontSize: 10, color: C.textDim, marginTop: 4 }}>
             Owned by: {entities.find(x => x.id === e.ownedBy)?.label || "—"} ({e.ownershipPct}%)
@@ -1508,6 +1549,14 @@ function EntitiesTab({ entities, setEntities }) {
               </div>}
               <Field label="Retirement Contributions (annual)"><Input value={e.retirementContrib} onChange={ev => updEntity(e.id, "retirementContrib", Number(ev.target.value))} type="number" prefix="$" /></Field>
               <Field label="Health Insurance (annual, deductible)"><Input value={e.healthInsurance} onChange={ev => updEntity(e.id, "healthInsurance", Number(ev.target.value))} type="number" prefix="$" /></Field>
+              {/* Approach C: Actual distributions */}
+              <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:8, marginTop:4 }}>
+                {"Cash Distributions (actual)"}
+              </div>
+              <Field label="Total Distributions Received (annual)"><Input value={e.actualDistributions} onChange={ev => updEntity(e.id, "actualDistributions", Number(ev.target.value))} type="number" prefix="$" /></Field>
+              {(e.actualDistributions||0) > 0 && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
+                <div style={{ fontSize:9, color:C.textMuted, marginBottom:4 }}>{"Draws + advances + year-end true-up"}</div>
+              </div>}
               <Field label="Notes"><Input value={e.notes} onChange={ev => updEntity(e.id, "notes", ev.target.value)} placeholder="Filing notes, EIN, etc." /></Field>
               <Btn variant="danger" onClick={() => delEntity(e.id)} style={{ marginTop: 4 }}>Delete Entity</Btn>
             </div>
@@ -1521,9 +1570,9 @@ function EntitiesTab({ entities, setEntities }) {
 // ─── SCENARIO ANALYSIS ──────────────────────────────────────────────────────
 const SCENARIO_PRESETS = [
   { id:"s_strong", label:"Strong Year (+$400K)", desc:"K-1 profit allocation up $400K",
-    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="k1_ordinary"?{...s,amount:(s.amount||0)+400000}:s); return [p,s2,a,d,e,l]; }},
+    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="business"&&s.timing==="quarterly"?{...s,amount:(s.amount||0)+400000}:s); return [p,s2,a,d,e,l]; }},
   { id:"s_weak", label:"Weak Year (-$400K)", desc:"K-1 profit allocation down $400K",
-    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="k1_ordinary"?{...s,amount:Math.max(0,(s.amount||0)-400000)}:s); return [p,s2,a,d,e,l]; }},
+    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="business"&&s.timing==="quarterly"?{...s,amount:Math.max(0,(s.amount||0)-400000)}:s); return [p,s2,a,d,e,l]; }},
   { id:"s_flex_2m", label:"Flex +$2M Collateral", desc:"Add $2M collateral to Flex SMA (same leverage)",
     apply:(p,st,a,d,e,l) => { const a2=a.map(x=>x.label?.includes("Flex")?{...x,nav:(x.nav||0)+2000000}:x); return [p,st,a2,d,e,l]; }},
   { id:"s_flex_upgrade", label:"Flex 145 to 250", desc:"Increase Flex leverage from F145 to F250 (-32% to -50% STCL)",
@@ -1790,11 +1839,11 @@ const PRELOAD_PROFILE = {
 };
 
 const PRELOAD_STREAMS = [
-  { id:"s1", type:"k1_guaranteed", label:"K-1 Guaranteed Payment - Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"Husband", qbi:false,
+  { id:"s1", type:"business", label:"Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s2", type:"k1_ordinary", label:"K-1 Ordinary - Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
+  { id:"s2", type:"business", label:"Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s3", type:"k1_ltcg", label:"K-1 LTCG - Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
+  { id:"s3", type:"ltcg", label:"Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
@@ -1833,9 +1882,10 @@ const PRELOAD_DEDUCTIONS = [
 const PRELOAD_ENTITIES = [
   { id:"e1", label:"Husband", type:"individual", filing:"1040 (MFJ)", color:C.gold, ownedBy:"", ownershipPct:100,
     notes:"Partner, BigLaw Test LLP - San Francisco office",
-    // Partnership tax properties
     pteElection:true, pteRate:9.3, pteState:"CA",
     retirementContrib:138000, healthInsurance:47000,
+    // Approach C: actual distributions received (draws + advances + true-up)
+    actualDistributions:1500000, distributionMonths:[2,5,8,11],
   },
   { id:"e2", label:"Wife", type:"individual", filing:"1040 (MFJ)", color:C.blue, ownedBy:"", ownershipPct:100,
     notes:"Spouse",
@@ -1864,39 +1914,39 @@ const PERSONA_PRESETS = [
     label: "BigLaw Partner", desc: "Senior partner at Am Law 100 firm",
     profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 25000 },
     streams: [
-      { type: "k1_guaranteed", label: "Guaranteed Payment — Partner Draw", amount: 1200000, timing: "monthly", entity: "Firm LLP", qbi: false },
-      { type: "k1_ordinary", label: "K-1 Ordinary — Firm Profit Allocation", amount: 800000, timing: "annual", timingMonth: 2, entity: "Firm LLP", qbi: true },
-      { type: "k1_ltcg", label: "K-1 LTCG — Firm Investment Gains", amount: 150000, timing: "annual", timingMonth: 2, entity: "Firm LLP", qbi: false },
+      { type: "business", label: "Guaranteed Payment — Partner Draw", amount: 1200000, timing: "monthly", entity: "Firm LLP", qbi: false },
+      { type: "business", label: "K-1 Ordinary — Firm Profit Allocation", amount: 800000, timing: "annual", timingMonth: 2, entity: "Firm LLP", qbi: true },
+      { type: "ltcg", label: "K-1 LTCG — Firm Investment Gains", amount: 150000, timing: "annual", timingMonth: 2, entity: "Firm LLP", qbi: false },
     ],
   },
   {
     label: "PE Fund GP", desc: "General Partner at mid-market PE firm",
     profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 35000 },
     streams: [
-      { type: "w2", label: "W-2 Salary — Management Company", amount: 400000, timing: "monthly", entity: "Fund Mgmt Co", qbi: false },
-      { type: "k1_guaranteed", label: "GP Mgmt Fee Share", amount: 600000, timing: "quarterly", entity: "Fund GP LLC", qbi: false },
-      { type: "k1_ltcg", label: "Carried Interest — Fund III", amount: 2000000, timing: "annual", timingMonth: 2, entity: "Fund III GP LLC", qbi: false },
-      { type: "k1_ordinary", label: "Monitoring Fee Income", amount: 200000, timing: "semi", entity: "Fund III GP LLC", qbi: false },
+      { type: "wages", label: "W-2 Salary — Management Company", amount: 400000, timing: "monthly", entity: "Fund Mgmt Co", qbi: false },
+      { type: "business", label: "GP Mgmt Fee Share", amount: 600000, timing: "quarterly", entity: "Fund GP LLC", qbi: false },
+      { type: "ltcg", label: "Carried Interest — Fund III", amount: 2000000, timing: "annual", timingMonth: 2, entity: "Fund III GP LLC", qbi: false },
+      { type: "business", label: "Monitoring Fee Income", amount: 200000, timing: "semi", entity: "Fund III GP LLC", qbi: false },
     ],
   },
   {
     label: "HF Portfolio Manager", desc: "Senior PM at multi-strat hedge fund",
     profile: { filingStatus: "mfj", state: "CT", stateRate: 6.99, livingExpenses: 30000 },
     streams: [
-      { type: "w2", label: "W-2 Base + Guaranteed Comp", amount: 500000, timing: "monthly", entity: "Fund Management LLC", qbi: false },
-      { type: "k1_ordinary", label: "K-1 Ordinary — Fund P&L Allocation", amount: 1500000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
-      { type: "k1_stcg", label: "K-1 STCG — Trading Gains", amount: 800000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
-      { type: "k1_ltcg", label: "K-1 LTCG — Longer-Dated Positions", amount: 400000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
+      { type: "wages", label: "W-2 Base + Guaranteed Comp", amount: 500000, timing: "monthly", entity: "Fund Management LLC", qbi: false },
+      { type: "business", label: "K-1 Ordinary — Fund P&L Allocation", amount: 1500000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
+      { type: "stcg", label: "K-1 STCG — Trading Gains", amount: 800000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
+      { type: "ltcg", label: "K-1 LTCG — Longer-Dated Positions", amount: 400000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
     ],
   },
   {
     label: "Real Estate Family", desc: "Multi-property rental portfolio",
     profile: { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 20000 },
     streams: [
-      { type: "rental", label: "Rental Net — Portfolio (8 units)", amount: 320000, timing: "monthly", entity: "RE Holdings LLC", qbi: true },
-      { type: "k1_1250", label: "Sec. 1250 Recapture — Property Sale", amount: 180000, timing: "annual", timingMonth: 5, entity: "RE Holdings LLC", qbi: false },
+      { type: "passive", label: "Rental Net — Portfolio (8 units)", amount: 320000, timing: "monthly", entity: "RE Holdings LLC", qbi: true },
+      { type: "business", label: "Sec. 1250 Recapture — Property Sale", amount: 180000, timing: "annual", timingMonth: 5, entity: "RE Holdings LLC", qbi: false },
       { type: "interest", label: "Money Market / T-Bills", amount: 120000, timing: "monthly", entity: "Direct", qbi: false },
-      { type: "qual_div", label: "REIT Qualified Dividends", amount: 45000, timing: "quarterly", entity: "Brokerage", qbi: false },
+      { type: "qualDiv", label: "REIT Qualified Dividends", amount: 45000, timing: "quarterly", entity: "Brokerage", qbi: false },
     ],
   },
 ];
