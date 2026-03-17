@@ -143,7 +143,7 @@ function ltcgStack(ordTaxable, ltcgAmt, brackets) {
   return tax;
 }
 
-function computeTax(profile, streams, assets, deductions, entities) {
+function computeTax(profile, streams, assets, deductions, entities, liabilities) {
   const p = TAX_PARAMS[profile.filingStatus] || TAX_PARAMS.mfj;
 
   // Build entity lookup by label
@@ -159,7 +159,8 @@ function computeTax(profile, streams, assets, deductions, entities) {
   streams.forEach(s => {
     const t = INCOME_TYPES[s.type];
     if (!t) return;
-    const a = s.amount || 0;
+    const pf = proFactor(s);
+    const a = (s.amount || 0) * pf;
     if (t.char==="ordEarned") ordEarned+=a;
     else if (t.char==="ordInv") ordInv+=a;
     else if (t.char==="stcg") stcg+=a;
@@ -176,25 +177,30 @@ function computeTax(profile, streams, assets, deductions, entities) {
     }
   });
 
-  // From assets — all asset types that generate income
-  let invDistributions=0, invCapCalls=0;
+  // From assets (with proration) + RE income routing
+  let invDistributions=0, invCapCalls=0, reCashFlow=0;
   assets.forEach(item => {
     const at = item.assetType;
+    const pf = proFactor(item);
     if (at==="cash") {
-      ordInv += (item.value||0) * (item.yieldPct||0) / 100;
+      ordInv += (item.value||0) * (item.yieldPct||0) / 100 * pf;
     } else if (at==="security") {
-      qualDiv += (item.value||0) * (item.divYieldPct||0) / 100;
-      ltcg += (item.value||0) * (item.realizedGainPct||0) / 100;
+      qualDiv += (item.value||0) * (item.divYieldPct||0) / 100 * pf;
+      ltcg += (item.value||0) * (item.realizedGainPct||0) / 100 * pf;
     } else if (at==="hedgeFund" || at==="peFund") {
       const nav = item.nav || 0;
-      ordInv     += nav * (item.ordPct || 0) / 100;
-      stcg       += nav * (item.stcgPct || 0) / 100;
-      ltcg       += nav * (item.ltcgPct || 0) / 100;
-      qualDiv    += nav * (item.qualDivPct || 0) / 100;
-      ordInv     += nav * (item.intPct || 0) / 100;
-      taxExempt  += nav * (item.taxExPct || 0) / 100;
-      invDistributions += nav * (item.distPct || 0) / 100;
-      invCapCalls += (item.unfunded||0) * (item.capCallPct || 0) / 100;
+      ordInv     += nav * (item.ordPct || 0) / 100 * pf;
+      stcg       += nav * (item.stcgPct || 0) / 100 * pf;
+      ltcg       += nav * (item.ltcgPct || 0) / 100 * pf;
+      qualDiv    += nav * (item.qualDivPct || 0) / 100 * pf;
+      ordInv     += nav * (item.intPct || 0) / 100 * pf;
+      taxExempt  += nav * (item.taxExPct || 0) / 100 * pf;
+      invDistributions += nav * (item.distPct || 0) / 100 * pf;
+      invCapCalls += (item.unfunded||0) * (item.capCallPct || 0) / 100 * pf;
+    } else if (at==="realEstate") {
+      const reTax = (item.taxableIncome||0) * pf;
+      reCashFlow += (item.netCashFlow||0) * pf;
+      if (profile.reProStatus) { ordEarned += reTax; } else { passive += reTax; }
     }
   });
 
@@ -225,6 +231,16 @@ function computeTax(profile, streams, assets, deductions, entities) {
   // PTET generates a state tax credit (dollar for dollar)
   // Health insurance is an above-the-line deduction (self-employed health)
 
+  // Step 1c: Liability interest deductions
+  let schedAInterest=0, totalLiabPayments=0;
+  (liabilities||[]).forEach(l => {
+    const lpf = proFactor(l);
+    const ai = (l.annualInterest||0) * lpf;
+    totalLiabPayments += (l.monthlyPayment||0) * 12 * lpf;
+    if (l.deductType==="schedA") schedAInterest += ai;
+    // schedE interest already in RE taxableIncome; investment interest handled at NII
+  });
+
   // Step 2: Schedule D capital gain netting
   let netST = stcg, netLT = ltcg;
   let netSTAfter=netST, netLTAfter=netLT, capitalLossOffset=0, capitalLossCarry=0;
@@ -243,9 +259,21 @@ function computeTax(profile, streams, assets, deductions, entities) {
     netSTAfter = 0; netLTAfter = 0;
   }
 
-  // Step 3: Taxable income
+  // Step 3: Passive Activity Loss (PAL) limitation
+  // Without RE Pro: passive losses are suspended (cannot offset non-passive income)
+  // With RE Pro: rental losses are non-passive (already routed to ordEarned above)
+  let passiveAllowed = passive;
+  let suspendedPAL = 0;
+  if (!profile.reProStatus && passive < 0) {
+    // $25K allowance for active participation if AGI < $100K (phased out $100-150K)
+    // For HNW clients this is always fully phased out, so suspended = full loss
+    passiveAllowed = 0;
+    suspendedPAL = Math.abs(passive);
+  }
+
+  // Step 4: Taxable income
   // Health insurance is above-the-line (reduces AGI)
-  const totalOrdinary = ordEarned + ordInv + passive + netSTAfter - capitalLossOffset - totalHealthIns;
+  const totalOrdinary = ordEarned + ordInv + passiveAllowed + netSTAfter - capitalLossOffset - totalHealthIns;
   const totalPref = netLTAfter + qualDiv;
   const agi = Math.max(0, totalOrdinary + totalPref);
 
@@ -256,7 +284,7 @@ function computeTax(profile, streams, assets, deductions, entities) {
   else if (agi < p.qbiHigh) { const frac = 1-(agi-p.qbiLow)/(p.qbiHigh-p.qbiLow); qbiDeduction = Math.min(qbiBase*frac, Math.max(0,totalOrdinary)*0.20); }
   qbiDeduction = Math.max(0, qbiDeduction);
 
-  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,10000) : t+(d.amount||0), 0);
+  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,10000) : t+(d.amount||0), 0) + schedAInterest;
   const useItemized = itemizedRaw > p.std;
   const deductionAmt = (useItemized ? itemizedRaw : p.std) + qbiDeduction;
 
@@ -267,8 +295,8 @@ function computeTax(profile, streams, assets, deductions, entities) {
   const ordTax = bracketTax(taxableOrd, p.brackets);
   const prefTax = ltcgStack(taxableOrd, taxablePref, p.ltcg);
 
-  // Step 5: NIIT - ordEarned is EXCLUDED from NII
-  const nii = Math.max(0, ordInv + Math.max(0,netSTAfter) + netLTAfter + qualDiv + passive);
+  // Step 6: NIIT - ordEarned is EXCLUDED from NII; use passiveAllowed (suspended PAL excluded)
+  const nii = Math.max(0, ordInv + Math.max(0,netSTAfter) + netLTAfter + qualDiv + passiveAllowed);
   const niitBase = Math.max(0, agi - p.niitFloor);
   const niit = Math.min(nii, niitBase) * 0.038;
 
@@ -305,8 +333,8 @@ function computeTax(profile, streams, assets, deductions, entities) {
   const netAfterWithholding = grossIncome - totalWithholding;
   const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
     - totalPTET - totalRetirement - totalHealthIns
-    - (profile.livingExpenses||0)*12 - (profile.debtService||0)*12
-    + invDistributions - invCapCalls;
+    - (profile.livingExpenses||0)*12 - totalLiabPayments
+    + invDistributions - invCapCalls + reCashFlow;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
   const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
@@ -315,7 +343,7 @@ function computeTax(profile, streams, assets, deductions, entities) {
   const pteFedSavings = totalPTET * (marginalOrd/100);
 
   return {
-    ordEarned, ordInv, stcg, ltcg, qualDiv, passive, taxExempt,
+    ordEarned, ordInv, stcg, ltcg, qualDiv, passive, passiveAllowed, suspendedPAL, taxExempt,
     netST, netLT, netSTAfter, netLTAfter, capitalLossOffset, capitalLossCarry,
     invOrdinary,
     totalOrdinary, totalPref, agi,
@@ -334,7 +362,8 @@ function computeTax(profile, streams, assets, deductions, entities) {
     remainingSH, penaltyEst,
     balanceDueFed, balanceDueState, overpaymentFed,
     // Cash flow
-    invDistributions, invCapCalls, invTaxExempt: taxExempt,
+    invDistributions, invCapCalls, invTaxExempt: taxExempt, reCashFlow,
+    schedAInterest, totalLiabPayments,
     netCashAfterTax, ordLossBenefit,
     // Back-compat
     totalLTCG: totalPref, taxableLTCG: taxablePref, ltcgTax: prefTax, marginalLTCG: marginalPref,
@@ -343,9 +372,9 @@ function computeTax(profile, streams, assets, deductions, entities) {
 }
 
 // ─── BALANCE SHEET ENGINE ──────────────────────────────────────────────────
-function computeBalanceSheet(assets) {
+function computeBalanceSheet(assets, liabilities) {
   let tiers = {1:0,2:0,3:0,4:0,R:0};
-  let totalAssets=0, totalBasis=0, totalEmbeddedGain=0, totalUnfunded=0, totalLiabilities=0;
+  let totalAssets=0, totalBasis=0, totalEmbeddedGain=0, totalUnfunded=0;
   let fundCount=0, nonFundCount=0;
 
   assets.forEach(a => {
@@ -355,34 +384,38 @@ function computeBalanceSheet(assets) {
     else if (at==="security") { val=a.value||0; basis=a.costBasis||val; tiers[2]+=val; nonFundCount++; }
     else if (at==="hedgeFund") { val=a.nav||0; basis=a.adjBasis||a.costBasis||val; tiers[3]+=val; fundCount++; }
     else if (at==="peFund") { val=a.nav||0; basis=a.adjBasis||a.costBasis||val; tiers[4]+=val; totalUnfunded+=a.unfunded||0; fundCount++; }
-    else if (at==="realEstate") { val=a.value||0; basis=a.costBasis||val; tiers[4]+=val; totalLiabilities+=a.mortgage||0; nonFundCount++; }
+    else if (at==="realEstate") { val=a.value||0; basis=a.costBasis||val; tiers[4]+=val; nonFundCount++; }
     else if (at==="retirement") { val=a.value||0; basis=0; tiers["R"]+=val; nonFundCount++; }
     totalAssets+=val; totalBasis+=basis; totalEmbeddedGain+=Math.max(0,val-basis);
   });
 
+  const totalLiabilities = (liabilities||[]).reduce((t,l) => t + (l.balance||0), 0);
   const netWorth = totalAssets - totalLiabilities;
   const liquidNW = tiers[1] + tiers[2] - totalLiabilities;
   return { tiers, totalAssets, totalBasis, totalEmbeddedGain, totalUnfunded, totalLiabilities, netWorth, liquidNW, fundCount, nonFundCount };
 }
 
 // ─── MONTHLY CASH FLOW ENGINE ───────────────────────────────────────────────
-function computeMonthlyCashflow(profile, streams, assets, result) {
+function computeMonthlyCashflow(profile, streams, assets, result, liabilities) {
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const qMap = {3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
   const qDue = {3:"Apr 15",5:"Jun 15",8:"Sep 15",0:"Jan 15"};
   const livingExp = profile.livingExpenses || 0;
-  const debtSvc = profile.debtService || 0;
 
-  // Entity-level deductions prorated monthly (reduce partnership distributions)
-  const pteMonthly = (result.totalPTET||0) / 12;
-  const retireMonthly = (result.totalRetirement||0) / 12;
-  const healthMonthly = (result.totalHealthIns||0) / 12;
-  const entityDeducMonthly = pteMonthly + retireMonthly + healthMonthly;
+  // Entity deductions prorated monthly
+  const entityDeducMonthly = ((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)) / 12;
+
+  // Liability payments per month (with proration)
+  const liabMonthly = (liabilities||[]).reduce((t,l) => t + (isActiveInMonth(l,0) ? (l.monthlyPayment||0) : 0), 0);
+
+  // RE cash flow per month
+  const reCFMonthly = (result.reCashFlow||0) / 12;
 
   let cumulative = 0;
   return months.map((m, i) => {
     let grossIn=0, withholding=0;
     streams.forEach(s => {
+      if (!isActiveInMonth(s, i)) return;
       const timing = s.timing || "monthly";
       let amt = 0;
       if (timing === "monthly") amt = (s.amount||0) / 12;
@@ -394,6 +427,7 @@ function computeMonthlyCashflow(profile, streams, assets, result) {
     });
 
     if ([5,11].includes(i)) grossIn += result.invDistributions / 2;
+    grossIn += reCFMonthly;
 
     const cashIn = grossIn - withholding;
 
@@ -403,11 +437,15 @@ function computeMonthlyCashflow(profile, streams, assets, result) {
     let capCall = 0;
     if ([2,5,8,11].includes(i)) capCall = result.invCapCalls / 4;
 
-    const net = cashIn - livingExp - debtSvc - estPmt - capCall - entityDeducMonthly;
+    // Liability payments for this month (check proration per liability)
+    let liabPmt = 0;
+    (liabilities||[]).forEach(l => { if (isActiveInMonth(l, i)) liabPmt += (l.monthlyPayment||0); });
+
+    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entityDeducMonthly;
     cumulative += net;
 
-    return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, debtSvc, capCall,
-      entityDeduc:entityDeducMonthly, pte:pteMonthly, retire:retireMonthly, health:healthMonthly,
+    return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, liabPmt,
+      capCall, entityDeduc:entityDeducMonthly,
       net, cumulative, qDue:qDue[i] };
   });
 }
@@ -426,11 +464,23 @@ const fmtD = (n, short = false) => {
 };
 const pct = (n) => `${(n || 0).toFixed(1)}%`;
 
+// ─── PRORATION HELPERS ──────────────────────────────────────────────────────
+const isActiveInMonth = (item, month) => {
+  const s = item.startMonth ?? 0;
+  const e = item.endMonth ?? 11;
+  return month >= s && month <= e;
+};
+const proFactor = (item) => {
+  const s = item.startMonth ?? 0;
+  const e = item.endMonth ?? 11;
+  return (e - s + 1) / 12;
+};
+
 const DEFAULT_PROFILE = {
   name: "", filingStatus: "mfj", state: "NY", stateRate: 10.9,
   priorYearLiability: 0, priorYearAgi: 0,
   q1Paid: 0, q2Paid: 0, q3Paid: 0, q4Paid: 0,
-  livingExpenses: 0, debtService: 0,
+  livingExpenses: 0, reProStatus: false,
 };
 
 const TABS = [
@@ -439,6 +489,7 @@ const TABS = [
   { id: "income", label: "Income", icon: "⟳" },
   { id: "deductions", label: "Deductions", icon: "§" },
   { id: "cashflow", label: "Cash Flow", icon: "⊞" },
+  { id: "scenarios", label: "Scenarios", icon: "⊘" },
   { id: "entities", label: "Entities", icon: "⬡" },
   { id: "esttax", label: "Est. Tax", icon: "⊕" },
 ];
@@ -545,7 +596,7 @@ function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
   const [s, setS] = useState(stream || {
     id: uid(), type: "w2", label: "", amount: 0, timing: "monthly", timingMonth: 11,
     qbi: false, entity: "",
-    fedWithholdingPct: 0, stateWithholdingPct: 0,
+    fedWithholdingPct: 0, stateWithholdingPct: 0, startMonth: 0, endMonth: 11,
   });
   const upd = (k, v) => setS(prev => ({ ...prev, [k]: v }));
   const typeInfo = INCOME_TYPES[s.type];
@@ -614,6 +665,13 @@ function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
       <input type="checkbox" checked={s.qbi} onChange={e => upd("qbi", e.target.checked)} />
       {"Qualifies for Sec. 199A QBI deduction"}
     </label>
+    {/* Proration */}
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, borderTop:`1px solid ${C.border}`, paddingTop:10, marginTop:8 }}>
+      <Field label="Start Month"><Select value={s.startMonth??0} onChange={e => upd("startMonth", Number(e.target.value))}
+        options={["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].map((m,i) => ({value:i,label:m}))} /></Field>
+      <Field label="End Month"><Select value={s.endMonth??11} onChange={e => upd("endMonth", Number(e.target.value))}
+        options={["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].map((m,i) => ({value:i,label:m}))} /></Field>
+    </div>
     <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
       <Btn variant="gold" onClick={() => onSave(s)} style={{ flex: 1 }}>Save Income Stream</Btn>
       {stream && <Btn variant="danger" onClick={() => onDelete(s.id)}>Delete</Btn>}
@@ -628,6 +686,7 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
     totalReturnPct:0, mgmtFee:0, perfFee:0,
     ordPct:0, stcgPct:0, ltcgPct:0, qualDivPct:0, intPct:0, taxExPct:0,
     distPct:0, capCallPct:0, entity:"", mortgage:0,
+    netCashFlow:0, taxableIncome:0, startMonth:0, endMonth:11,
   });
   const upd = (k,v) => setA(p => ({...p, [k]:v}));
   const isFund = a.assetType==="hedgeFund" || a.assetType==="peFund";
@@ -764,8 +823,20 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
         <Field label="Fair Market Value"><Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
         <Field label="Cost Basis"><Input value={a.costBasis} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
       </div>
-      <Field label="Mortgage Balance"><Input value={a.mortgage} onChange={e => upd("mortgage", Number(e.target.value))} type="number" prefix="$" /></Field>
       {gain > 0 && <div style={{ fontSize:11, color:C.orange }}>{"Embedded gain: "}{fmtD(gain, true)}</div>}
+      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
+        {"Income (annual)"}
+      </div>
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+        <Field label="Net Cash Flow"><Input value={a.netCashFlow} onChange={e => upd("netCashFlow", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Taxable Income (Sch E)"><Input value={a.taxableIncome} onChange={e => upd("taxableIncome", Number(e.target.value))} type="number" prefix="$" /></Field>
+      </div>
+      {(a.netCashFlow||0)!==0 && (a.taxableIncome||0)!==0 && (a.netCashFlow||0)!==(a.taxableIncome||0) && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
+          <span>{"Depreciation Shield"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.green }}>{fmtD((a.netCashFlow||0)-(a.taxableIncome||0), true)}</span>
+        </div>
+      </div>}
     </>}
 
     {/* Retirement */}
@@ -773,6 +844,13 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
       <Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" />
     </Field>}
 
+    {/* Proration */}
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, borderTop:`1px solid ${C.border}`, paddingTop:10, marginTop:8 }}>
+      <Field label="Start Month"><Select value={a.startMonth??0} onChange={e => upd("startMonth", Number(e.target.value))}
+        options={["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].map((m,i) => ({value:i,label:m}))} /></Field>
+      <Field label="End Month"><Select value={a.endMonth??11} onChange={e => upd("endMonth", Number(e.target.value))}
+        options={["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].map((m,i) => ({value:i,label:m}))} /></Field>
+    </div>
     <div style={{ display:"flex", gap:8, marginTop:8 }}>
       <Btn variant="gold" onClick={() => onSave(a)} style={{ flex:1 }}>Save Asset</Btn>
       {asset && <Btn variant="danger" onClick={() => onDelete(a.id)}>Delete</Btn>}
@@ -819,9 +897,10 @@ function OverviewTab({ profile, result, streams, assets, updProfile, bs }) {
         <Field label="Monthly Living Exp.">
           <Input value={profile.livingExpenses} onChange={e => updProfile("livingExpenses", Number(e.target.value))} type="number" prefix="$" />
         </Field>
-        <Field label="Monthly Debt Svc.">
-          <Input value={profile.debtService} onChange={e => updProfile("debtService", Number(e.target.value))} type="number" prefix="$" />
-        </Field>
+        <label style={{ display:"flex", alignItems:"center", gap:8, fontSize:12, color:C.textDim, cursor:"pointer", marginTop:4 }}>
+          <input type="checkbox" checked={profile.reProStatus||false} onChange={e => updProfile("reProStatus", e.target.checked)} />
+          {"RE Professional Status (rental losses offset ordinary)"}
+        </label>
       </div>
     </Card>
 
@@ -1176,7 +1255,6 @@ function BalanceSheetTab({ assets, bs, onEdit, onAdd, onDelete }) {
                   <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.text }}>{fmtD(val, true)}</div>
                   {annualIncome!==0 && <div style={{ fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:annualIncome>0?C.cyan:C.green }}>{fmtD(annualIncome, true)}/yr</div>}
                   {gain!==0 && basis>0 && basis!==val && <div style={{ fontSize:10, fontFamily:"'IBM Plex Mono',monospace", color:gain>0?C.orange:C.green }}>{fmtD(gain, true)} gain</div>}
-                  {(a.mortgage||0)>0 && <div style={{ fontSize:10, color:C.red }}>{"Mtg: "}{fmtD(a.mortgage, true)}</div>}
                 </div>
                 <Btn variant="ghost" onClick={e => { e.stopPropagation(); onDelete(a.id); }} style={{ fontSize:10, padding:"3px 8px", color:C.red }}>{"x"}</Btn>
               </div>
@@ -1189,13 +1267,16 @@ function BalanceSheetTab({ assets, bs, onEdit, onAdd, onDelete }) {
 }
 
 // ─── DEDUCTIONS TAB ─────────────────────────────────────────────────────────
-function DeductionsTab({ deductions, setDeductions, profile, updProfile, result }) {
+function DeductionsTab({ deductions, setDeductions, profile, updProfile, result, liabilities, setLiabs }) {
   const addDed = (type) => setDeductions(prev => [...prev, { id: uid(), type, amount: 0, label: "" }]);
   const updDed = (id, k, v) => setDeductions(prev => prev.map(d => d.id === id ? { ...d, [k]: v } : d));
   const delDed = (id) => setDeductions(prev => prev.filter(d => d.id !== id));
+  const addLiab = () => setLiabs(prev => [...prev, { id:uid(), label:"", balance:0, monthlyPayment:0, annualInterest:0, deductType:"schedA", startMonth:0, endMonth:11 }]);
+  const updLiab = (id, k, v) => setLiabs(prev => prev.map(l => l.id===id ? {...l,[k]:v} : l));
+  const delLiab = (id) => setLiabs(prev => prev.filter(l => l.id!==id));
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-    <SectionHeader sub="Itemized deductions and prior year safe harbor inputs">{"Deductions & Prior Year"}</SectionHeader>
+    <SectionHeader sub="Deductions, liabilities, and prior year safe harbor">{"Deductions, Liabilities & Prior Year"}</SectionHeader>
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ fontSize: 10, color: C.accent, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 12 }}>Prior Year (for Safe Harbor)</div>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
@@ -1207,9 +1288,37 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result 
         </Field>
       </div>
     </Card>
+    {/* Liabilities */}
+    <Card style={{ padding: "20px 24px" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+        <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.15em", textTransform:"uppercase" }}>Liabilities</div>
+        <Btn variant="ghost" onClick={addLiab} style={{ fontSize:9, border:`1px solid ${C.border}`, borderRadius:3 }}>{"+ Add Liability"}</Btn>
+      </div>
+      {(liabilities||[]).length === 0 && <div style={{ textAlign:"center", padding:20, color:C.textMuted, fontSize:12 }}>No liabilities. Add mortgages, SBLOCs, margin loans, etc.</div>}
+      {(liabilities||[]).map(l => (
+        <div key={l.id} style={{ padding:"10px 0", borderBottom:`1px solid ${C.border}` }}>
+          <div style={{ display:"grid", gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr auto", gap:8, alignItems:"end" }}>
+            <Field label="Label"><Input value={l.label||""} onChange={e => updLiab(l.id, "label", e.target.value)} /></Field>
+            <Field label="Balance"><Input value={l.balance} onChange={e => updLiab(l.id, "balance", Number(e.target.value))} type="number" prefix="$" /></Field>
+            <Field label="Mo. Payment"><Input value={l.monthlyPayment} onChange={e => updLiab(l.id, "monthlyPayment", Number(e.target.value))} type="number" prefix="$" /></Field>
+            <Field label="Ann. Interest"><Input value={l.annualInterest} onChange={e => updLiab(l.id, "annualInterest", Number(e.target.value))} type="number" prefix="$" /></Field>
+            <Field label="Deductibility">
+              <Select value={l.deductType||"schedA"} onChange={e => updLiab(l.id, "deductType", e.target.value)}
+                options={[{value:"schedA",label:"Sched A (res. mortgage)"},{value:"schedE",label:"Sched E (inv. property)"},{value:"investment",label:"Inv. Interest"},{value:"none",label:"Non-deductible"}]} />
+            </Field>
+            <Btn variant="ghost" onClick={() => delLiab(l.id)} style={{ color:C.red, marginBottom:2 }}>{"x"}</Btn>
+          </div>
+        </div>
+      ))}
+      {(liabilities||[]).length > 0 && <div style={{ display:"flex", justifyContent:"space-between", paddingTop:8, fontSize:11 }}>
+        <span style={{ color:C.textDim }}>{"Total Balances"}</span>
+        <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.red }}>{fmtD((liabilities||[]).reduce((t,l)=>t+(l.balance||0),0), true)}</span>
+      </div>}
+    </Card>
+    {/* Itemized Deductions */}
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-        <div style={{ fontSize: 10, color: C.accent, letterSpacing: "0.15em", textTransform: "uppercase" }}>Itemized Deductions</div>
+        <div style={{ fontSize: 10, color: C.accent, letterSpacing: "0.15em", textTransform: "uppercase" }}>{"Itemized Deductions"}</div>
         <div style={{ display: "flex", gap: 4 }}>
           {DEDUCTION_TYPES.map(dt => (
             <Btn key={dt.id} variant="ghost" onClick={() => addDed(dt.id)}
@@ -1217,14 +1326,19 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result 
           ))}
         </div>
       </div>
-      {deductions.length === 0 && <div style={{ textAlign: "center", padding: 20, color: C.textMuted, fontSize: 12 }}>No deductions added. Use buttons above to add.</div>}
+      {result.schedAInterest > 0 && <div style={{ display:"flex", gap:10, alignItems:"center", padding:"8px 0", borderBottom:`1px solid ${C.border}` }}>
+        <div style={{ flex:1, fontSize:12, color:C.textDim }}>{"Mortgage Interest (from liabilities)"}</div>
+        <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.text }}>{fmtD(result.schedAInterest)}</div>
+        <Badge color={C.blue}>auto</Badge>
+      </div>}
+      {deductions.length === 0 && result.schedAInterest <= 0 && <div style={{ textAlign: "center", padding: 20, color: C.textMuted, fontSize: 12 }}>No deductions added. Use buttons above to add.</div>}
       {deductions.map(d => {
         const dt = DEDUCTION_TYPES.find(t => t.id === d.type);
         return <div key={d.id} style={{ display: "flex", gap: 10, alignItems: "center", padding: "8px 0", borderBottom: `1px solid ${C.border}` }}>
           <div style={{ flex: 1, fontSize: 12, color: C.textDim }}>{dt?.label || d.type}</div>
           <Input value={d.amount} onChange={e => updDed(d.id, "amount", Number(e.target.value))} type="number" prefix="$" style={{ width: 120 }} />
-          {dt?.max && d.amount > dt.max && <Badge color={C.red}>Capped at ${fmt(dt.max)}</Badge>}
-          <Btn variant="ghost" onClick={() => delDed(d.id)} style={{ color: C.red }}>✕</Btn>
+          {dt?.max && d.amount > dt.max && <Badge color={C.red}>{"Capped at $"}{fmt(dt.max)}</Badge>}
+          <Btn variant="ghost" onClick={() => delDed(d.id)} style={{ color: C.red }}>{"x"}</Btn>
         </div>;
       })}
     </Card>
@@ -1233,9 +1347,9 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result 
 
 // ─── CASH FLOW TAB ──────────────────────────────────────────────────────────
 
-function CashFlowTab({ profile, streams, result }) {
-  const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, [], result), [profile, streams, result]);
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.debtSvc+m.capCall+m.withholding+m.entityDeduc)));
+function CashFlowTab({ profile, streams, result, liabilities }) {
+  const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, [], result, liabilities), [profile, streams, result, liabilities]);
+  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.withholding+m.entityDeduc)));
   const barH = 140;
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -1268,7 +1382,7 @@ function CashFlowTab({ profile, streams, result }) {
     {/* Bar chart */}
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living+Debt",c:C.textDim},{l:"Cap Calls",c:C.purple}]
+        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liabilities",c:C.blue},{l:"Cap Calls",c:C.purple}]
           .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:C.textMuted }}>
             <div style={{ width:8, height:8, borderRadius:2, background:x.c }} />{x.l}
           </div>)}
@@ -1279,7 +1393,7 @@ function CashFlowTab({ profile, streams, result }) {
           const entH = maxVal>0 ? (m.entityDeduc/maxVal)*barH : 0;
           const whH = maxVal>0 ? (m.withholding/maxVal)*barH : 0;
           const taxH = maxVal>0 ? (m.estPmt/maxVal)*barH : 0;
-          const expH = maxVal>0 ? ((m.livingExp+m.debtSvc)/maxVal)*barH : 0;
+          const expH = maxVal>0 ? (m.livingExp/maxVal)*barH : 0;
           const capH = maxVal>0 ? (m.capCall/maxVal)*barH : 0;
           return <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
             <div style={{ fontSize:9, color:m.net>=0?C.green:C.red, fontFamily:"'IBM Plex Mono',monospace" }}>
@@ -1291,6 +1405,7 @@ function CashFlowTab({ profile, streams, result }) {
               <div style={{ height:whH, background:C.orange+"66", minHeight:whH>0?2:0 }} />
               <div style={{ height:taxH, background:C.red+"88", minHeight:taxH>0?2:0 }} />
               <div style={{ height:expH, background:C.textDim+"44", minHeight:expH>0?2:0 }} />
+              {(() => { const lH = maxVal>0?(m.liabPmt/maxVal)*barH:0; return <div style={{ height:lH, background:C.blue+"66", minHeight:lH>0?2:0 }} />; })()}
               <div style={{ height:capH, background:C.purple+"66", borderRadius:"0 0 3px 3px", minHeight:capH>0?2:0 }} />
             </div>
             <div style={{ fontSize:9, color:C.textMuted }}>{m.month}</div>
@@ -1306,7 +1421,7 @@ function CashFlowTab({ profile, streams, result }) {
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${C.borderLight}` }}>
-            {["Month","Gross In","W/H","Ent. Ded","Net In","Est. Tax","Living","Debt","Calls","Net","Cum."].map(h =>
+            {["Month","Gross In","W/H","Ent. Ded","Net In","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
               <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:7, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
             )}
           </tr>
@@ -1315,7 +1430,7 @@ function CashFlowTab({ profile, streams, result }) {
           {monthly.map((m,i) => (
             <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
               <td style={{ padding:"6px 4px", color:C.text, fontSize:11 }}>{m.month}{m.qDue ? <span style={{ fontSize:8, color:C.red, marginLeft:3 }}>({m.qDue})</span> : ""}</td>
-              {[m.grossIn, m.withholding, m.entityDeduc, m.cashIn - m.entityDeduc, m.estPmt, m.livingExp, m.debtSvc, m.capCall, m.net, m.cumulative].map((v,j) =>
+              {[m.grossIn, m.withholding, m.entityDeduc, m.cashIn - m.entityDeduc, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
                 <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10,
                   color: j===1?C.orange : j===2?C.accent : j>=8?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
               )}
@@ -1400,6 +1515,121 @@ function EntitiesTab({ entities, setEntities }) {
         </Card>
       ))}
     </div>
+  </div>;
+}
+
+// ─── SCENARIO ANALYSIS ──────────────────────────────────────────────────────
+const SCENARIO_PRESETS = [
+  { id:"s_strong", label:"Strong Year (+$400K)", desc:"K-1 profit allocation up $400K",
+    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="k1_ordinary"?{...s,amount:(s.amount||0)+400000}:s); return [p,s2,a,d,e,l]; }},
+  { id:"s_weak", label:"Weak Year (-$400K)", desc:"K-1 profit allocation down $400K",
+    apply:(p,st,a,d,e,l) => { const s2=st.map(s=>s.type==="k1_ordinary"?{...s,amount:Math.max(0,(s.amount||0)-400000)}:s); return [p,s2,a,d,e,l]; }},
+  { id:"s_flex_2m", label:"Flex +$2M Collateral", desc:"Add $2M collateral to Flex SMA (same leverage)",
+    apply:(p,st,a,d,e,l) => { const a2=a.map(x=>x.label?.includes("Flex")?{...x,nav:(x.nav||0)+2000000}:x); return [p,st,a2,d,e,l]; }},
+  { id:"s_flex_upgrade", label:"Flex 145 to 250", desc:"Increase Flex leverage from F145 to F250 (-32% to -50% STCL)",
+    apply:(p,st,a,d,e,l) => { const a2=a.map(x=>x.label?.includes("Flex")?{...x,stcgPct:-50,qualDivPct:1}:x); return [p,st,a2,d,e,l]; }},
+  { id:"s_flex_both", label:"Flex +$2M + Upgrade to 250", desc:"More collateral AND higher leverage",
+    apply:(p,st,a,d,e,l) => { const a2=a.map(x=>x.label?.includes("Flex")?{...x,nav:(x.nav||0)+2000000,stcgPct:-50,qualDivPct:1}:x); return [p,st,a2,d,e,l]; }},
+  { id:"s_delphi_up", label:"Delphi +$3M", desc:"Increase Delphi Plus to ~$8.4M",
+    apply:(p,st,a,d,e,l) => { const a2=a.map(x=>x.label?.includes("Delphi")?{...x,nav:(x.nav||0)+3000000}:x); return [p,st,a2,d,e,l]; }},
+  { id:"s_florida", label:"Move to Florida", desc:"0% state income tax",
+    apply:(p,st,a,d,e,l) => [{ ...p, state:"FL", stateRate:0 },st,a,d,e,l] },
+  { id:"s_repro", label:"RE Professional", desc:"Spouse qualifies - rental losses offset ordinary",
+    apply:(p,st,a,d,e,l) => [{ ...p, reProStatus:true },st,a,d,e,l] },
+  { id:"s_no_pte", label:"No PTET", desc:"Disable PTE election - see SALT workaround value",
+    apply:(p,st,a,d,e,l) => { const e2=e.map(x=>x.pteElection?{...x,pteElection:false}:x); return [p,st,a,d,e2,l]; }},
+];
+
+function ScenariosTab({ profile, streams, assets, deductions, entities, liabilities, result }) {
+  const [active, setActive] = useState(["s_flex_2m","s_flex_upgrade","s_delphi_up"]);
+  const toggle = (id) => setActive(prev => prev.includes(id) ? prev.filter(x=>x!==id) : [...prev, id]);
+
+  const scenarios = useMemo(() => {
+    return active.map(id => {
+      const preset = SCENARIO_PRESETS.find(p=>p.id===id);
+      if (!preset) return null;
+      const [p2,st2,a2,d2,e2,l2] = preset.apply(profile,streams,assets,deductions,entities,liabilities);
+      const r = computeTax(p2,st2,a2,d2,e2,l2);
+      return { ...preset, result:r, delta:r.totalTax - result.totalTax };
+    }).filter(Boolean);
+  }, [active, profile, streams, assets, deductions, entities, liabilities, result]);
+
+  const metrics = [
+    {l:"AGI", f:r=>r.agi},
+    {l:"Ordinary", f:r=>r.totalOrdinary},
+    {l:"Pref.", f:r=>r.totalPref},
+    {l:"Fed Tax", f:r=>r.federalTax},
+    {l:"State Tax", f:r=>r.stateTaxAfterPTE},
+    {l:"NIIT", f:r=>r.niit},
+    {l:"Total Tax", f:r=>r.totalTax},
+    {l:"Eff. Rate", f:r=>r.effectiveRate, pct:true},
+    {l:"PTET", f:r=>r.totalPTET},
+    {l:"Susp. PAL", f:r=>r.suspendedPAL},
+    {l:"Net Cash", f:r=>r.netCashAfterTax},
+  ];
+
+  return <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+    <SectionHeader sub="Toggle scenarios to compare against your base case">{"Scenario Analysis"}</SectionHeader>
+    {/* Toggle buttons */}
+    <div style={{ display:"flex", flexWrap:"wrap", gap:6 }}>
+      {SCENARIO_PRESETS.map(p => {
+        const on = active.includes(p.id);
+        return <button key={p.id} onClick={() => toggle(p.id)} style={{
+          padding:"8px 14px", borderRadius:4, fontSize:11, cursor:"pointer", fontFamily:"inherit",
+          background:on?C.accent+"18":"none", border:`1px solid ${on?C.accent:C.border}`, color:on?C.accent:C.textMuted,
+        }}><div style={{ fontWeight:500 }}>{p.label}</div>
+          <div style={{ fontSize:9, color:C.textMuted, marginTop:2 }}>{p.desc}</div>
+        </button>;
+      })}
+    </div>
+    {/* Comparison table */}
+    {scenarios.length > 0 && <Card style={{ padding:"16px 20px", overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:11 }}>
+        <thead>
+          <tr style={{ borderBottom:`2px solid ${C.border}` }}>
+            <th style={{ textAlign:"left", padding:"8px 6px", fontSize:9, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>Metric</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:9, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:500 }}>Base Case</th>
+            {scenarios.map(s => <th key={s.id} style={{ textAlign:"right", padding:"8px 6px", fontSize:9, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{s.label}</th>)}
+          </tr>
+        </thead>
+        <tbody>
+          {metrics.map((m,i) => (
+            <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
+              <td style={{ padding:"6px", color:C.text, fontSize:11 }}>{m.l}</td>
+              <td style={{ padding:"6px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", color:C.accent, fontWeight:500 }}>
+                {m.pct ? pct(m.f(result)) : fmtD(m.f(result), true)}
+              </td>
+              {scenarios.map(s => {
+                const base = m.f(result);
+                const sc = m.f(s.result);
+                const d = sc - base;
+                return <td key={s.id} style={{ padding:"6px", textAlign:"right" }}>
+                  <div style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.text }}>{m.pct ? pct(sc) : fmtD(sc, true)}</div>
+                  {Math.abs(d) > (m.pct ? 0.05 : 50) && <div style={{ fontSize:9, fontFamily:"'IBM Plex Mono',monospace",
+                    color:m.l.includes("Tax")||m.l==="NIIT"||m.l==="Eff. Rate"||m.l==="Susp. PAL" ? (d<0?C.green:C.red) : (d>0?C.green:C.red) }}>
+                    {d>0?"+":""}{m.pct ? pct(d) : fmtD(d, true)}
+                  </div>}
+                </td>;
+              })}
+            </tr>
+          ))}
+          {/* Total tax delta summary row */}
+          <tr style={{ borderTop:`2px solid ${C.border}`, background:C.accent+"08" }}>
+            <td style={{ padding:"8px 6px", fontSize:12, color:C.text, fontWeight:500 }}>{"Tax Delta vs. Base"}</td>
+            <td style={{ padding:"8px 6px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", color:C.accent }}>{"--"}</td>
+            {scenarios.map(s => (
+              <td key={s.id} style={{ padding:"8px 6px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:13, fontWeight:600,
+                color:s.delta<0?C.green:s.delta>0?C.red:C.textDim }}>
+                {s.delta>0?"+":""}{fmtD(s.delta, true)}
+              </td>
+            ))}
+          </tr>
+        </tbody>
+      </table>
+    </Card>}
+    {scenarios.length === 0 && <Card style={{ padding:40, textAlign:"center" }}>
+      <div style={{ fontSize:13, color:C.textMuted }}>{"Toggle scenarios above to see comparison analysis."}</div>
+    </Card>}
   </div>;
 }
 
@@ -1556,7 +1786,7 @@ const PRELOAD_PROFILE = {
   name: "Test Family", filingStatus: "mfj", state: "CA", stateRate: 14.3,
   priorYearLiability: 1050000, priorYearAgi: 2900000,
   q1Paid: 275000, q2Paid: 275000, q3Paid: 0, q4Paid: 0,
-  livingExpenses: 28000, debtService: 14000,
+  livingExpenses: 28000, reProStatus: false,
 };
 
 const PRELOAD_STREAMS = [
@@ -1565,8 +1795,6 @@ const PRELOAD_STREAMS = [
   { id:"s2", type:"k1_ordinary", label:"K-1 Ordinary - Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
   { id:"s3", type:"k1_ltcg", label:"K-1 LTCG - Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
-    fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s4", type:"rental", label:"Net Rental Income - Pacific Heights Duplex", amount:72000, timing:"monthly", entity:"Test RE Holdings LLC", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
@@ -1591,7 +1819,7 @@ const PRELOAD_ASSETS = [
     totalReturnPct:22,mgmtFee:2.0,perfFee:20,ordPct:-1,stcgPct:0,ltcgPct:5,qualDivPct:0,intPct:0,taxExPct:0,
     distPct:8,capCallPct:25,entity:"Test Family Trust"},
   // Real Estate (Tier 4)
-  {id:"a8",assetType:"realEstate",label:"Pacific Heights Duplex",value:3500000,costBasis:2200000,mortgage:1400000,entity:"Test RE Holdings LLC"},
+  {id:"a8",assetType:"realEstate",label:"Pacific Heights Duplex",value:3500000,costBasis:2200000,netCashFlow:72000,taxableIncome:-15000,entity:"Test RE Holdings LLC"},
   // Retirement (Tier R)
   {id:"a9",assetType:"retirement",label:"Husband 401(k) / Profit-Sharing",value:1200000,entity:"Husband"},
   {id:"a10",assetType:"retirement",label:"Wife IRA (Rollover)",value:380000,entity:"Wife"},
@@ -1599,7 +1827,6 @@ const PRELOAD_ASSETS = [
 
 const PRELOAD_DEDUCTIONS = [
   { id: "d1", type: "salt", amount: 10000, label: "SALT (CA - capped)" },
-  { id: "d2", type: "mortgage", amount: 72000, label: "Mortgage Interest - Pacific Heights" },
   { id: "d3", type: "charitable", amount: 40000, label: "Annual Charitable (DAF + Direct)" },
 ];
 
@@ -1624,11 +1851,18 @@ const PRELOAD_ENTITIES = [
   },
 ];
 
-// ─── PERSONA PRESETS ────────────────────────────────────────────────────────
+const PRELOAD_LIABILITIES = [
+  { id:"l1", label:"Primary Residence Mortgage", balance:1400000, monthlyPayment:8200, annualInterest:72000,
+    deductType:"schedA", assetId:"a8", startMonth:0, endMonth:11 },
+  { id:"l2", label:"Schwab SBLOC", balance:0, monthlyPayment:0, annualInterest:0,
+    deductType:"investment", assetId:"", startMonth:0, endMonth:11 },
+];
+
+// --- PERSONA PRESETS ────────────────────────────────────────────────────────
 const PERSONA_PRESETS = [
   {
     label: "BigLaw Partner", desc: "Senior partner at Am Law 100 firm",
-    profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 25000, debtService: 8000 },
+    profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 25000 },
     streams: [
       { type: "k1_guaranteed", label: "Guaranteed Payment — Partner Draw", amount: 1200000, timing: "monthly", entity: "Firm LLP", qbi: false },
       { type: "k1_ordinary", label: "K-1 Ordinary — Firm Profit Allocation", amount: 800000, timing: "annual", timingMonth: 2, entity: "Firm LLP", qbi: true },
@@ -1637,7 +1871,7 @@ const PERSONA_PRESETS = [
   },
   {
     label: "PE Fund GP", desc: "General Partner at mid-market PE firm",
-    profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 35000, debtService: 15000 },
+    profile: { filingStatus: "mfj", state: "NY", stateRate: 10.9, livingExpenses: 35000 },
     streams: [
       { type: "w2", label: "W-2 Salary — Management Company", amount: 400000, timing: "monthly", entity: "Fund Mgmt Co", qbi: false },
       { type: "k1_guaranteed", label: "GP Mgmt Fee Share", amount: 600000, timing: "quarterly", entity: "Fund GP LLC", qbi: false },
@@ -1647,7 +1881,7 @@ const PERSONA_PRESETS = [
   },
   {
     label: "HF Portfolio Manager", desc: "Senior PM at multi-strat hedge fund",
-    profile: { filingStatus: "mfj", state: "CT", stateRate: 6.99, livingExpenses: 30000, debtService: 12000 },
+    profile: { filingStatus: "mfj", state: "CT", stateRate: 6.99, livingExpenses: 30000 },
     streams: [
       { type: "w2", label: "W-2 Base + Guaranteed Comp", amount: 500000, timing: "monthly", entity: "Fund Management LLC", qbi: false },
       { type: "k1_ordinary", label: "K-1 Ordinary — Fund P&L Allocation", amount: 1500000, timing: "annual", timingMonth: 2, entity: "Fund LP", qbi: false },
@@ -1657,7 +1891,7 @@ const PERSONA_PRESETS = [
   },
   {
     label: "Real Estate Family", desc: "Multi-property rental portfolio",
-    profile: { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 20000, debtService: 18000 },
+    profile: { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 20000 },
     streams: [
       { type: "rental", label: "Rental Net — Portfolio (8 units)", amount: 320000, timing: "monthly", entity: "RE Holdings LLC", qbi: true },
       { type: "k1_1250", label: "Sec. 1250 Recapture — Property Sale", amount: 180000, timing: "annual", timingMonth: 5, entity: "RE Holdings LLC", qbi: false },
@@ -1675,11 +1909,12 @@ export default function YosemitePlatform() {
   const [assets, setAssets] = useState(PRELOAD_ASSETS);
   const [deductions, setDeds] = useState(PRELOAD_DEDUCTIONS);
   const [entities, setEntities] = useState(PRELOAD_ENTITIES);
+  const [liabilities, setLiabs] = useState(PRELOAD_LIABILITIES);
   const [panel, setPanel] = useState(null);
 
   const updProfile = (k, v) => setProfile(p => ({ ...p, [k]: v }));
-  const result = useMemo(() => computeTax(profile, streams, assets, deductions, entities), [profile, streams, assets, deductions, entities]);
-  const bs = useMemo(() => computeBalanceSheet(assets), [assets]);
+  const result = useMemo(() => computeTax(profile, streams, assets, deductions, entities, liabilities), [profile, streams, assets, deductions, entities, liabilities]);
+  const bs = useMemo(() => computeBalanceSheet(assets, liabilities), [assets, liabilities]);
 
   const saveStream = (s) => { setStreams(p => p.find(x => x.id === s.id) ? p.map(x => x.id === s.id ? s : x) : [...p, s]); setPanel(null); };
   const delStream = (id) => { setStreams(p => p.filter(x => x.id !== id)); setPanel(null); };
@@ -1690,8 +1925,8 @@ export default function YosemitePlatform() {
     if (persona.profile) Object.entries(persona.profile).forEach(([k, v]) => updProfile(k, v));
     setStreams(prev => [...prev, ...persona.streams.map(s => ({ ...s, id: uid() }))]);
   };
-  const resetAll = () => { setProfile(PRELOAD_PROFILE); setStreams(PRELOAD_STREAMS); setAssets(PRELOAD_ASSETS); setDeds(PRELOAD_DEDUCTIONS); setEntities(PRELOAD_ENTITIES); };
-  const clearAll = () => { setProfile(DEFAULT_PROFILE); setStreams([]); setAssets([]); setDeds([]); setEntities([]); };
+  const resetAll = () => { setProfile(PRELOAD_PROFILE); setStreams(PRELOAD_STREAMS); setAssets(PRELOAD_ASSETS); setDeds(PRELOAD_DEDUCTIONS); setEntities(PRELOAD_ENTITIES); setLiabs(PRELOAD_LIABILITIES); };
+  const clearAll = () => { setProfile(DEFAULT_PROFILE); setStreams([]); setAssets([]); setDeds([]); setEntities([]); setLiabs([]); };
 
   return <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'Inter',system-ui,sans-serif", color: C.text, display: "flex" }}>
     <style>{`
@@ -1780,8 +2015,9 @@ export default function YosemitePlatform() {
       {tab === "overview" && <OverviewTab profile={profile} result={result} streams={streams} assets={assets} updProfile={updProfile} bs={bs} />}
       {tab === "balsheet" && <BalanceSheetTab assets={assets} bs={bs} onEdit={a => setPanel({type:"asset",data:a})} onAdd={() => setPanel({type:"asset",data:null})} onDelete={delAsset} />}
       {tab === "income" && <IncomeTab streams={streams} assets={assets} onEdit={s => setPanel({ type: "income", data: s })} onAdd={() => setPanel({ type: "income", data: null })} onDelete={delStream} />}
-      {tab === "deductions" && <DeductionsTab deductions={deductions} setDeductions={setDeds} profile={profile} updProfile={updProfile} result={result} />}
-      {tab === "cashflow" && <CashFlowTab profile={profile} streams={streams} result={result} />}
+      {tab === "deductions" && <DeductionsTab deductions={deductions} setDeductions={setDeds} profile={profile} updProfile={updProfile} result={result} liabilities={liabilities} setLiabs={setLiabs} />}
+      {tab === "cashflow" && <CashFlowTab profile={profile} streams={streams} result={result} liabilities={liabilities} />}
+      {tab === "scenarios" && <ScenariosTab profile={profile} streams={streams} assets={assets} deductions={deductions} entities={entities} liabilities={liabilities} result={result} />}
       {tab === "entities" && <EntitiesTab entities={entities} setEntities={setEntities} />}
       {tab === "esttax" && <EstTaxTab profile={profile} updProfile={updProfile} result={result} streams={streams} />}
     </div>
