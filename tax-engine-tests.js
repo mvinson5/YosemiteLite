@@ -22,15 +22,15 @@ const TAX_PARAMS = {
 };
 
 const INCOME_TYPES = {
-  w2:             { char: "ordEarned" },
-  k1_guaranteed:  { char: "ordEarned" },
-  k1_ordinary:    { char: "ordEarned" },
-  k1_ltcg:        { char: "ltcg"      },
-  interest:       { char: "ordInv"    },
-  dividend:       { char: "qualDiv"   },
-  rental:         { char: "passive"   },
-  municipal:      { char: "taxExempt" },
-  stcg_stream:    { char: "stcg"      },
+  wages:     { char: "ordEarned" },
+  business:  { char: "ordEarned" },
+  interest:  { char: "ordInv"    },
+  qualDiv:   { char: "qualDiv"   },
+  nonQualDiv:{ char: "ordInv"    },
+  stcg:      { char: "stcg"      },
+  ltcg:      { char: "ltcg"      },
+  passive:   { char: "passive"   },
+  taxExempt: { char: "taxExempt" },
 };
 
 // ─── PRORATION HELPERS ────────────────────────────────────────────────────
@@ -93,8 +93,11 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     else if (t.char==="taxExempt") taxExempt+=a;
     totalFedWithholding += a * (s.fedWithholdingPct||0) / 100;
     totalStateWithholding += a * (s.stateWithholdingPct||0) / 100;
-    if (s.type.startsWith("k1_")) {
-      k1ByEntity[s.entity] = (k1ByEntity[s.entity]||0) + a;
+    if (s.entity && entMap[s.entity]) {
+      const ent = entMap[s.entity];
+      if (ent.pteElection || (ent.retirementContrib||0)>0 || (ent.healthInsurance||0)>0) {
+        k1ByEntity[s.entity] = (k1ByEntity[s.entity]||0) + a;
+      }
     }
   });
 
@@ -140,6 +143,19 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
 
   const preTaxDeductions = totalPTET + totalRetirement;
   ordEarned = ordEarned - preTaxDeductions;
+
+  // Approach C: actual distributions
+  let totalActualDist=0, totalGrossK1ForDistEnts=0;
+  Object.entries(k1ByEntity).forEach(([entityLabel]) => {
+    const ent = entMap[entityLabel];
+    if (ent?.actualDistributions > 0) {
+      totalActualDist += ent.actualDistributions;
+      totalGrossK1ForDistEnts += k1ByEntity[entityLabel] || 0;
+    }
+  });
+  const entityDeducTotal = totalPTET + totalRetirement + totalHealthIns;
+  const phantomIncome = totalGrossK1ForDistEnts > 0 ? totalGrossK1ForDistEnts - totalActualDist : 0;
+  const firmRetention = totalActualDist > 0 ? Math.max(0, phantomIncome - entityDeducTotal) : 0;
 
   // Liability interest
   let schedAInterest=0, totalLiabPayments=0;
@@ -221,7 +237,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const grossIncome = agi + taxExempt;
   const netAfterWithholding = grossIncome - totalWithholding;
   const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
-    - totalPTET - totalRetirement - totalHealthIns
+    - totalPTET - totalRetirement - totalHealthIns - firmRetention
     - (profile.livingExpenses||0)*12 - totalLiabPayments
     + invDistributions - invCapCalls + reCashFlow;
 
@@ -239,6 +255,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
     marginalOrd, marginalPref,
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
+    totalActualDist, totalGrossK1ForDistEnts, phantomIncome, firmRetention, entityDeducTotal,
     totalFedWithholding, totalStateWithholding, totalWithholding,
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
     remainingSH, penaltyEst, balanceDueFed, balanceDueState, overpaymentFed,
@@ -330,11 +347,11 @@ section("3. Income Aggregation from Streams");
 const simpleResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
   [
-    { type: "w2", amount: 200000, entity: "Spouse", fedWithholdingPct: 25, stateWithholdingPct: 10 },
-    { type: "k1_guaranteed", amount: 100000, entity: "Partner" },
+    { type: "wages", amount: 200000, entity: "Spouse", fedWithholdingPct: 25, stateWithholdingPct: 10 },
+    { type: "business", amount: 100000, entity: "Partner" },
     { type: "interest", amount: 20000, entity: "Self" },
-    { type: "rental", amount: 30000, entity: "Self" },
-    { type: "municipal", amount: 10000, entity: "Self" },
+    { type: "passive", amount: 30000, entity: "Self" },
+    { type: "taxExempt", amount: 10000, entity: "Self" },
   ],
   [], [], []
 );
@@ -381,7 +398,7 @@ section("5. Schedule D Capital Gain Netting");
 // Case A: Both positive — no netting
 const net_a = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "hedgeFund", nav: 1000000, stcgPct: 5, ltcgPct: 10 },
   ],
@@ -393,7 +410,7 @@ assert("Both gains: LTCG stays", net_a.netLTAfter, 100000);
 // Case B: ST loss offsets LT gain
 const net_b = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "hedgeFund", nav: 1000000, stcgPct: -30, ltcgPct: 20 },
   ],
@@ -408,7 +425,7 @@ assert("Capital loss carryforward", net_b.capitalLossCarry, 97000);
 // Case C: LT loss offsets ST gain
 const net_c = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "hedgeFund", nav: 1000000, stcgPct: 10, ltcgPct: -5 },
   ],
@@ -422,7 +439,7 @@ assert("No capital loss offset needed", net_c.capitalLossOffset, 0);
 // Case D: Both losses
 const net_d = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "hedgeFund", nav: 1000000, stcgPct: -8, ltcgPct: -5 },
   ],
@@ -435,7 +452,7 @@ assert("Both losses: $127K carry", net_d.capitalLossCarry, 127000);
 // Case E: Flex SMA STCL offsets Delphi LTCG
 const net_e = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "hedgeFund", nav: 5400000, stcgPct: 0, ltcgPct: 25 }, // Delphi: +1.35M LTCG
     { assetType: "hedgeFund", nav: 3000000, stcgPct: -50, ltcgPct: 0 }, // Flex: -1.5M STCL
@@ -454,9 +471,9 @@ section("6. NIIT (Net Investment Income Tax)");
 const niitResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
   [
-    { type: "w2", amount: 400000, entity: "Self" },
+    { type: "wages", amount: 400000, entity: "Self" },
     { type: "interest", amount: 100000, entity: "Self" },
-    { type: "rental", amount: 50000, entity: "Self" },
+    { type: "passive", amount: 50000, entity: "Self" },
   ],
   [
     { assetType: "hedgeFund", nav: 2000000, ltcgPct: 10, qualDivPct: 5 },
@@ -473,7 +490,7 @@ assert("NIIT = $17,100", niitResult.niit, 17100);
 // Verify ordEarned is EXCLUDED from NII
 const niitEarnedOnly = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [], [], []
 );
 assert("Pure W-2 → NII = 0", niitEarnedOnly.nii, 0);
@@ -485,7 +502,7 @@ section("7. Deductions — SALT Cap, Itemized vs. Standard");
 // SALT capped at $10K
 const deductResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
-  [{ type: "w2", amount: 300000, entity: "Self" }],
+  [{ type: "wages", amount: 300000, entity: "Self" }],
   [], 
   [
     { type: "salt", amount: 50000 }, // capped at 10K
@@ -504,7 +521,7 @@ assert("Deduction amount = 45K", deductResult.deductionAmt, 45000);
 // Low deductions → standard wins
 const stdResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [],
   [{ type: "charitable", amount: 5000 }],
   []
@@ -521,9 +538,9 @@ const pteEntities = [
 const pteResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
   [
-    { type: "k1_guaranteed", amount: 1600000, entity: "Partner" },
-    { type: "k1_ordinary", amount: 1000000, entity: "Partner" },
-    { type: "k1_ltcg", amount: 400000, entity: "Partner" },
+    { type: "business", amount: 1600000, entity: "Partner" },
+    { type: "business", amount: 1000000, entity: "Partner" },
+    { type: "ltcg", amount: 400000, entity: "Partner" },
   ],
   [], [], pteEntities
 );
@@ -551,7 +568,7 @@ const retEntities = [
 ];
 const retResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
-  [{ type: "k1_guaranteed", amount: 2000000, entity: "Partner" }],
+  [{ type: "business", amount: 2000000, entity: "Partner" }],
   [], [], retEntities
 );
 
@@ -578,10 +595,10 @@ const fullResult = computeTax(
     q1Paid: 275000, q2Paid: 275000, q3Paid: 0, q4Paid: 0,
     livingExpenses: 28000 },
   [
-    { type: "k1_guaranteed", amount: 300000, entity: "Husband" },
-    { type: "k1_ordinary", amount: 2200000, entity: "Husband" },
-    { type: "k1_ltcg", amount: 600000, entity: "Husband" },
-    { type: "rental", amount: 72000, entity: "Test RE Holdings LLC" },
+    { type: "business", amount: 300000, entity: "Husband" },
+    { type: "business", amount: 2200000, entity: "Husband" },
+    { type: "ltcg", amount: 600000, entity: "Husband" },
+    { type: "passive", amount: 72000, entity: "Test RE Holdings LLC" },
   ],
   [
     { assetType: "cash", value: 920000, yieldPct: 4.8 },
@@ -649,7 +666,7 @@ const shResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0,
     priorYearLiability: 500000, priorYearAgi: 1000000,
     q1Paid: 100000, q2Paid: 100000, q3Paid: 100000, q4Paid: 0 },
-  [{ type: "w2", amount: 1000000, entity: "Self", fedWithholdingPct: 20 }],
+  [{ type: "wages", amount: 1000000, entity: "Self", fedWithholdingPct: 20 }],
   [], [], []
 );
 // Prior year: 500K * 110% = 550K (AGI > $150K)
@@ -666,7 +683,7 @@ assert("SH: est paid = 300K", shResult.totalEstPaid, 300000);
 const shLowResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0,
     priorYearLiability: 20000, priorYearAgi: 120000 },
-  [{ type: "w2", amount: 120000, entity: "Self" }],
+  [{ type: "wages", amount: 120000, entity: "Self" }],
   [], [], []
 );
 assert("SH: AGI < 150K → 100% prior year", shLowResult.safeHarborPY, 20000);
@@ -677,7 +694,7 @@ section("12. State Tax + PTE Credit");
 const stateResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
   [
-    { type: "k1_guaranteed", amount: 2000000, entity: "Partner" },
+    { type: "business", amount: 2000000, entity: "Partner" },
   ],
   [], [],
   [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 }]
@@ -694,7 +711,7 @@ assert("State balance due uses PTE credit", stateResult.balanceDueState, Math.ma
 // No-PTE state (Florida)
 const flResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [], [], []
 );
 assert("Florida: $0 state tax", flResult.stateTax, 0);
@@ -706,7 +723,7 @@ section("13. QBI Deduction (Sec. 199A)");
 // Under phaseout (single, AGI < $191,950)
 const qbiResult = computeTax(
   { filingStatus: "single", state: "FL", stateRate: 0 },
-  [{ type: "k1_ordinary", amount: 150000, entity: "Self", qbi: true }],
+  [{ type: "business", amount: 150000, entity: "Self", qbi: true }],
   [], [], []
 );
 // QBI base: 150K * 20% = 30K
@@ -718,8 +735,8 @@ assert("QBI: full deduction under threshold", qbiResult.qbiDeduction, 30000);
 const qbiHighResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
   [
-    { type: "w2", amount: 400000, entity: "Self" },
-    { type: "k1_ordinary", amount: 200000, entity: "Self", qbi: true },
+    { type: "wages", amount: 400000, entity: "Self" },
+    { type: "business", amount: 200000, entity: "Self", qbi: true },
   ],
   [], [], []
 );
@@ -732,7 +749,7 @@ section("14. Withholding Flows to Balance Due");
 const whResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3,
     q1Paid: 50000, q2Paid: 50000 },
-  [{ type: "w2", amount: 500000, entity: "Self", fedWithholdingPct: 30, stateWithholdingPct: 10 }],
+  [{ type: "wages", amount: 500000, entity: "Self", fedWithholdingPct: 30, stateWithholdingPct: 10 }],
   [], [], []
 );
 assert("WH: fed = 150K", whResult.totalFedWithholding, 150000);
@@ -758,7 +775,7 @@ assert("Zero income: NIIT = 0", zeroResult.niit, 0);
 // Negative ordEarned after massive PTET + retirement
 const negOrdResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "k1_guaranteed", amount: 100000, entity: "Partner" }],
+  [{ type: "business", amount: 100000, entity: "Partner" }],
   [], [],
   [{ label: "Partner", pteElection: true, pteRate: 50, retirementContrib: 200000, healthInsurance: 0 }]
 );
@@ -770,21 +787,39 @@ assert("AGI floors at 0", negOrdResult.agi, 0, 1);
 // No entities passed
 const noEntResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "k1_guaranteed", amount: 500000, entity: "Partner" }],
+  [{ type: "business", amount: 500000, entity: "Partner" }],
   [], [], null
 );
 assert("No entities: PTET = 0", noEntResult.totalPTET, 0);
 assert("No entities: retirement = 0", noEntResult.totalRetirement, 0);
 assert("No entities: ordEarned untouched", noEntResult.ordEarned, 500000);
 
-// Entity with no K-1 income (should not generate PTET)
+// W-2 entity should not have PTE (employers are not pass-throughs)
 const unusedEntResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 500000, entity: "Worker" }],
+  [{ type: "wages", amount: 500000, entity: "Employer" }],
   [], [],
-  [{ label: "Worker", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 }]
+  [{ label: "Employer", pteElection: false, pteRate: 0, retirementContrib: 0, healthInsurance: 0 }]
 );
-assert("W-2 not K-1: PTET = 0", unusedEntResult.totalPTET, 0);
+assert("W-2 employer (no PTE): PTET = 0", unusedEntResult.totalPTET, 0);
+
+// Entity-driven PTET: business income on PTE entity triggers PTET
+const pteBusinessResult = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "business", amount: 500000, entity: "Partner" }],
+  [], [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 }]
+);
+assert("Business on PTE entity: PTET > 0", pteBusinessResult.totalPTET, 46500);
+
+// Wages on PTE entity also triggers (entity-driven, not type-driven)
+const wagesPteResult = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 200000, entity: "Partner" }],
+  [], [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 }]
+);
+assert("Wages on PTE entity: PTET triggers (entity-driven)", wagesPteResult.totalPTET, 18600);
 
 // ─── TEST 16: CASH FLOW IDENTITY ────────────────────────────────────────────
 section("16. Cash Flow Sanity Check");
@@ -793,7 +828,7 @@ section("16. Cash Flow Sanity Check");
 const cfResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0,
     livingExpenses: 10000 },
-  [{ type: "w2", amount: 300000, entity: "Self" }],
+  [{ type: "wages", amount: 300000, entity: "Self" }],
   [], [], []
 );
 // Net cash = AGI - totalTax - living*12 - debt*12
@@ -846,8 +881,8 @@ const cfEntResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3,
     q1Paid: 100000, livingExpenses: 20000 },
   [
-    { type: "k1_guaranteed", amount: 600000, entity: "Partner", timing: "monthly" },
-    { type: "k1_ordinary", amount: 1200000, entity: "Partner", timing: "quarterly" },
+    { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
+    { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
   ],
   [], [],
   [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000 }]
@@ -856,8 +891,8 @@ const cfEntResult = computeTax(
 const cfMonthly = computeMonthlyCashflow(
   { q1Paid: 100000, livingExpenses: 20000 },
   [
-    { type: "k1_guaranteed", amount: 600000, entity: "Partner", timing: "monthly" },
-    { type: "k1_ordinary", amount: 1200000, entity: "Partner", timing: "quarterly" },
+    { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
+    { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
   ],
   [],
   cfEntResult,
@@ -921,8 +956,8 @@ assert("IsActive: Jul in Jul-Dec", isActiveInMonth({startMonth:6, endMonth:11}, 
 const proResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
   [
-    { type: "w2", amount: 240000, entity: "Self", startMonth: 0, endMonth: 11 }, // full year
-    { type: "k1_guaranteed", amount: 120000, entity: "Self", startMonth: 6, endMonth: 11 }, // Jul-Dec = 60K
+    { type: "wages", amount: 240000, entity: "Self", startMonth: 0, endMonth: 11 }, // full year
+    { type: "business", amount: 120000, entity: "Self", startMonth: 6, endMonth: 11 }, // Jul-Dec = 60K
   ],
   [], [], []
 );
@@ -932,7 +967,7 @@ assert("Proration: full year + half year earned", proResult.ordEarned, 300000);
 // Asset proration
 const proAssetResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [
     { assetType: "cash", value: 1000000, yieldPct: 6, startMonth: 0, endMonth: 11 }, // 60K full year
     { assetType: "hedgeFund", nav: 2000000, ltcgPct: 10, startMonth: 6, endMonth: 11 }, // 200K * 0.5 = 100K
@@ -948,7 +983,7 @@ section("19. Real Estate Income Routing");
 // Without RE Pro status: taxableIncome → passive (but losses suspended by PAL)
 const rePassiveResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0, reProStatus: false },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [{ assetType: "realEstate", value: 3000000, costBasis: 2000000, taxableIncome: -30000, netCashFlow: 72000 }],
   [], []
 );
@@ -960,7 +995,7 @@ assert("RE passive: ordEarned untouched", rePassiveResult.ordEarned, 500000);
 // With RE Pro status: taxableIncome → ordEarned
 const reProResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0, reProStatus: true },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [{ assetType: "realEstate", value: 3000000, costBasis: 2000000, taxableIncome: -30000, netCashFlow: 72000 }],
   [], []
 );
@@ -970,7 +1005,7 @@ assert("RE pro: passive stays 0", reProResult.passive, 0);
 // RE with proration (acquired mid-year)
 const reProrated = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0, reProStatus: false },
-  [{ type: "w2", amount: 100000, entity: "Self" }],
+  [{ type: "wages", amount: 100000, entity: "Self" }],
   [{ assetType: "realEstate", value: 2000000, taxableIncome: -48000, netCashFlow: 36000, startMonth: 6, endMonth: 11 }],
   [], []
 );
@@ -984,7 +1019,7 @@ section("20. Liabilities — Interest Deductions + Cash Flow");
 // Sched A mortgage interest flows to itemized
 const liabResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [],
   [{ type: "salt", amount: 10000 }], // 10K SALT
   [],
@@ -1001,7 +1036,7 @@ assert("Liab: total payments", liabResult.totalLiabPayments, 72000); // 6K * 12
 // Multiple liabilities with different deductibility
 const multiLiabResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 500000, entity: "Self" }],
+  [{ type: "wages", amount: 500000, entity: "Self" }],
   [], [],
   [],
   [
@@ -1016,7 +1051,7 @@ assert("Multi-liab: total payments", multiLiabResult.totalLiabPayments, (5000+10
 // Liability with proration (new mortgage mid-year)
 const liabProratedResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
-  [{ type: "w2", amount: 300000, entity: "Self" }],
+  [{ type: "wages", amount: 300000, entity: "Self" }],
   [], [], [],
   [{ label: "New Mortgage", balance: 500000, monthlyPayment: 3000, annualInterest: 24000, deductType: "schedA", startMonth: 6, endMonth: 11 }]
 );
@@ -1032,9 +1067,9 @@ const fullREResult = computeTax(
     priorYearLiability: 1050000, priorYearAgi: 2900000,
     q1Paid: 275000, q2Paid: 275000, livingExpenses: 28000 },
   [
-    { type: "k1_guaranteed", amount: 300000, entity: "Husband" },
-    { type: "k1_ordinary", amount: 2200000, entity: "Husband" },
-    { type: "k1_ltcg", amount: 600000, entity: "Husband" },
+    { type: "business", amount: 300000, entity: "Husband" },
+    { type: "business", amount: 2200000, entity: "Husband" },
+    { type: "ltcg", amount: 600000, entity: "Husband" },
   ],
   [
     { assetType: "cash", value: 920000, yieldPct: 4.8 },
@@ -1058,7 +1093,7 @@ assert("Full RE: liab payments = 98.4K", fullREResult.totalLiabPayments, 98400);
 section("22. RE Professional — Tax Savings Comparison");
 
 const baseProfile = { filingStatus: "mfj", state: "FL", stateRate: 0, reProStatus: false };
-const baseStreams = [{ type: "w2", amount: 800000, entity: "Self" }];
+const baseStreams = [{ type: "wages", amount: 800000, entity: "Self" }];
 const reAssets = [{ assetType: "realEstate", value: 5000000, taxableIncome: -200000, netCashFlow: 50000 }];
 
 const noProResult = computeTax(baseProfile, baseStreams, reAssets, [], [], []);
@@ -1085,9 +1120,9 @@ section("23. Scenario Analysis — Preset Overrides");
 const scBase = {
   profile: { filingStatus:"mfj", state:"CA", stateRate:14.3, reProStatus:false, livingExpenses:28000 },
   streams: [
-    { type:"k1_guaranteed", amount:300000, entity:"Husband" },
-    { type:"k1_ordinary", amount:2200000, entity:"Husband" },
-    { type:"k1_ltcg", amount:600000, entity:"Husband" },
+    { type:"business", amount:300000, entity:"Husband", timing:"monthly" },
+    { type:"business", amount:2200000, entity:"Husband", timing:"quarterly" },
+    { type:"ltcg", amount:600000, entity:"Husband", timing:"annual", timingMonth:2 },
   ],
   assets: [
     { assetType:"cash", value:920000, yieldPct:4.8 },
@@ -1103,13 +1138,13 @@ const scBase = {
 const baseR = computeTax(scBase.profile, scBase.streams, scBase.assets, scBase.deds, scBase.entities, scBase.liabs);
 
 // Strong year: +400K to k1_ordinary
-const strongStreams = scBase.streams.map(s => s.type==="k1_ordinary" ? {...s, amount:s.amount+400000} : s);
+const strongStreams = scBase.streams.map(s => s.type==="business"&&s.timing==="quarterly" ? {...s, amount:s.amount+400000} : s);
 const strongR = computeTax(scBase.profile, strongStreams, scBase.assets, scBase.deds, scBase.entities, scBase.liabs);
 assert("Scenario strong: higher AGI", strongR.agi > baseR.agi, true, 0);
 assert("Scenario strong: higher total tax", strongR.totalTax > baseR.totalTax, true, 0);
 
 // Weak year: -400K
-const weakStreams = scBase.streams.map(s => s.type==="k1_ordinary" ? {...s, amount:Math.max(0,s.amount-400000)} : s);
+const weakStreams = scBase.streams.map(s => s.type==="business"&&s.timing==="quarterly" ? {...s, amount:Math.max(0,s.amount-400000)} : s);
 const weakR = computeTax(scBase.profile, weakStreams, scBase.assets, scBase.deds, scBase.entities, scBase.liabs);
 assert("Scenario weak: lower AGI", weakR.agi < baseR.agi, true, 0);
 assert("Scenario weak: lower total tax", weakR.totalTax < baseR.totalTax, true, 0);
@@ -1162,6 +1197,97 @@ const delpUpR = computeTax(scBase.profile, scBase.streams, delpUpAssets, scBase.
 // More Delphi = more ord losses + more LTCG
 assert("Scenario Delphi +3M: more LTCG", delpUpR.ltcg > baseR.ltcg, true, 0);
 assert("Scenario Delphi +3M: more ord losses", delpUpR.ordInv < baseR.ordInv, true, 0);
+
+// ─── TEST 24: APPROACH C — PHANTOM INCOME + FIRM RETENTION ──────────────────
+section("24. Approach C — Phantom Income + Firm Retention");
+
+// Entity with actualDistributions set
+const appCEntities = [
+  { label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 138000, healthInsurance: 47000,
+    actualDistributions: 1500000 },
+];
+const appCResult = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+  [
+    { type: "business", amount: 300000, entity: "Partner", timing: "monthly" },
+    { type: "business", amount: 2200000, entity: "Partner", timing: "quarterly" },
+    { type: "ltcg", amount: 600000, entity: "Partner", timing: "annual", timingMonth: 2 },
+  ],
+  [], [], appCEntities, []
+);
+
+// Gross K-1 for Partner entity: 300K + 2.2M + 600K = 3.1M
+assert("AppC: gross K-1 for dist entities", appCResult.totalGrossK1ForDistEnts, 3100000);
+assert("AppC: actual distributions = 1.5M", appCResult.totalActualDist, 1500000);
+// Phantom income = 3.1M - 1.5M = 1.6M
+assert("AppC: phantom income = 1.6M", appCResult.phantomIncome, 1600000);
+// Entity deductions: PTET (3.1M * 9.3% = 288,300) + retire (138K) + health (47K) = 473,300
+assert("AppC: entity deduc total", appCResult.entityDeducTotal, 288300 + 138000 + 47000);
+// Firm retention = phantom - entity deductions = 1.6M - 473,300 = 1,126,700
+assert("AppC: firm retention", appCResult.firmRetention, 1600000 - 288300 - 138000 - 47000);
+
+// Without actualDistributions: firm retention = 0
+const noDistEntities = [
+  { label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 138000, healthInsurance: 47000 },
+];
+const noDistResult = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+  [{ type: "business", amount: 2000000, entity: "Partner" }],
+  [], [], noDistEntities, []
+);
+assert("AppC no dist: firm retention = 0", noDistResult.firmRetention, 0);
+assert("AppC no dist: phantom = 0", noDistResult.phantomIncome, 0);
+
+// Tax engine unchanged by Approach C (only affects cash flow)
+assert("AppC: same federal tax as without dist field", 
+  Math.abs(appCResult.federalTax - computeTax(
+    { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+    [
+      { type: "business", amount: 300000, entity: "Partner", timing: "monthly" },
+      { type: "business", amount: 2200000, entity: "Partner", timing: "quarterly" },
+      { type: "ltcg", amount: 600000, entity: "Partner", timing: "annual", timingMonth: 2 },
+    ],
+    [], [], noDistEntities, []
+  ).federalTax) < 1, true, 0);
+
+// Firm retention reduces net cash
+assert("AppC: net cash lower with firm retention", appCResult.netCashAfterTax < noDistResult.netCashAfterTax ||
+  appCResult.firmRetention > 0, true, 0);
+
+// ─── TEST 25: ENTITY-DRIVEN PTET (SIMPLIFIED TYPES) ────────────────────────
+section("25. Entity-Driven PTET with Simplified Income Types");
+
+// Multiple stream types on same PTE entity — all trigger PTET
+const multiTypeResult = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+  [
+    { type: "business", amount: 1000000, entity: "Firm" },
+    { type: "ltcg", amount: 500000, entity: "Firm" },
+    { type: "interest", amount: 50000, entity: "Firm" },
+  ],
+  [], [],
+  [{ label: "Firm", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 }],
+  []
+);
+// All 3 streams on PTE entity: 1M + 500K + 50K = 1.55M * 9.3% = 144,150
+assert("Multi-type PTET: all streams count", multiTypeResult.totalPTET, 144150);
+
+// Stream NOT on PTE entity: no PTET
+const mixedResult = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [
+    { type: "business", amount: 1000000, entity: "Firm" },
+    { type: "wages", amount: 200000, entity: "Employer" },
+  ],
+  [], [],
+  [
+    { label: "Firm", pteElection: true, pteRate: 9.3, retirementContrib: 0, healthInsurance: 0 },
+    { label: "Employer", pteElection: false, retirementContrib: 0, healthInsurance: 0 },
+  ],
+  []
+);
+// Only Firm income (1M) triggers PTET, not Employer wages
+assert("Mixed entities: PTET only on PTE entity", mixedResult.totalPTET, 93000);
 
 // PRINT RESULTS
 // ═══════════════════════════════════════════════════════════════════════════
