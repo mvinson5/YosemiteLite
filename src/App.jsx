@@ -373,9 +373,14 @@ function computeMonthlyCashflow(profile, streams, assets, result) {
   const livingExp = profile.livingExpenses || 0;
   const debtSvc = profile.debtService || 0;
 
+  // Entity-level deductions prorated monthly (reduce partnership distributions)
+  const pteMonthly = (result.totalPTET||0) / 12;
+  const retireMonthly = (result.totalRetirement||0) / 12;
+  const healthMonthly = (result.totalHealthIns||0) / 12;
+  const entityDeducMonthly = pteMonthly + retireMonthly + healthMonthly;
+
   let cumulative = 0;
   return months.map((m, i) => {
-    // Gross income per stream, with withholding computed per stream
     let grossIn=0, withholding=0;
     streams.forEach(s => {
       const timing = s.timing || "monthly";
@@ -388,23 +393,22 @@ function computeMonthlyCashflow(profile, streams, assets, result) {
       withholding += amt * ((s.fedWithholdingPct||0) + (s.stateWithholdingPct||0)) / 100;
     });
 
-    // Investment distributions (semi-annual Jun/Dec)
     if ([5,11].includes(i)) grossIn += result.invDistributions / 2;
 
     const cashIn = grossIn - withholding;
 
-    // Estimated tax payments (quarterly)
     let estPmt = 0;
     if (qMap[i] !== undefined) estPmt = profile[qMap[i]] || 0;
 
-    // Cap calls (quarterly)
     let capCall = 0;
     if ([2,5,8,11].includes(i)) capCall = result.invCapCalls / 4;
 
-    const net = cashIn - livingExp - debtSvc - estPmt - capCall;
+    const net = cashIn - livingExp - debtSvc - estPmt - capCall - entityDeducMonthly;
     cumulative += net;
 
-    return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, debtSvc, capCall, net, cumulative, qDue:qDue[i] };
+    return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, debtSvc, capCall,
+      entityDeduc:entityDeducMonthly, pte:pteMonthly, retire:retireMonthly, health:healthMonthly,
+      net, cumulative, qDue:qDue[i] };
   });
 }
 
@@ -480,7 +484,27 @@ function Field({ label, children, style: sx = {} }) {
   </div>;
 }
 
+function NumInput({ value, onChange, prefix, style: sx = {}, ...rest }) {
+  // Local string state for free-form editing; commit parsed number on blur/Enter
+  const [raw, setRaw] = useState(null); // null = not editing
+  const display = raw !== null ? raw : (value === 0 || value === null || value === undefined ? "" : String(value));
+  const commit = (str) => {
+    setRaw(null);
+    const n = parseFloat(str);
+    onChange({ target: { value: isNaN(n) ? 0 : n } });
+  };
+  return <div style={{ display: "flex", alignItems: "center", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "0 10px" }}>
+    {prefix && <span style={{ fontSize: 11, color: C.textMuted, marginRight: 4 }}>{prefix}</span>}
+    <input value={display} onChange={e => setRaw(e.target.value)}
+      onBlur={e => commit(e.target.value)}
+      onKeyDown={e => { if (e.key === "Enter") commit(e.target.value); }}
+      type="text" inputMode="decimal" {...rest}
+      style={{ background: "none", border: "none", color: C.text, fontSize: 13, padding: "8px 0", outline: "none", width: "100%", fontFamily: "'IBM Plex Mono',monospace", ...sx }} />
+  </div>;
+}
+
 function Input({ value, onChange, type = "text", prefix, style: sx = {}, ...rest }) {
+  if (type === "number") return <NumInput value={value} onChange={onChange} prefix={prefix} style={sx} {...rest} />;
   return <div style={{ display: "flex", alignItems: "center", background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 4, padding: "0 10px" }}>
     {prefix && <span style={{ fontSize: 11, color: C.textMuted, marginRight: 4 }}>{prefix}</span>}
     <input value={value} onChange={onChange} type={type} {...rest}
@@ -565,8 +589,8 @@ function IncomePanel({ stream, onSave, onDelete, onClose, entities }) {
       {"Withholding (reduces cash received, credits against tax)"}
     </div>
     <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-      <Field label="Federal W/H %"><Input value={s.fedWithholdingPct||0} onChange={e => upd("fedWithholdingPct", Number(e.target.value))} type="number" /></Field>
-      <Field label="State W/H %"><Input value={s.stateWithholdingPct||0} onChange={e => upd("stateWithholdingPct", Number(e.target.value))} type="number" /></Field>
+      <Field label="Federal W/H %"><Input value={s.fedWithholdingPct} onChange={e => upd("fedWithholdingPct", Number(e.target.value))} type="number" /></Field>
+      <Field label="State W/H %"><Input value={s.stateWithholdingPct} onChange={e => upd("stateWithholdingPct", Number(e.target.value))} type="number" /></Field>
     </div>
     {/* Show note if entity has PTE election */}
     {(() => { const ent = (entities||[]).find(e => e.label === s.entity); return ent?.pteElection ? <div style={{ fontSize:10, color:C.accent, background:C.accent+"08", padding:"6px 10px", borderRadius:4 }}>
@@ -641,8 +665,8 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
     {/* Cash */}
     {a.assetType==="cash" && <>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Balance"><Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Yield %"><Input value={a.yieldPct||0} onChange={e => upd("yieldPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Balance"><Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Yield %"><Input value={a.yieldPct} onChange={e => upd("yieldPct", Number(e.target.value))} type="number" /></Field>
       </div>
       {(a.yieldPct||0) > 0 && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
         <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
@@ -655,12 +679,12 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
     {/* Securities */}
     {a.assetType==="security" && <>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Current Value"><Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Cost Basis"><Input value={a.costBasis||0} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Current Value"><Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Cost Basis"><Input value={a.costBasis} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Dividend Yield %"><Input value={a.divYieldPct||0} onChange={e => upd("divYieldPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="Est. Realized Gain %"><Input value={a.realizedGainPct||0} onChange={e => upd("realizedGainPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Dividend Yield %"><Input value={a.divYieldPct} onChange={e => upd("divYieldPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Est. Realized Gain %"><Input value={a.realizedGainPct} onChange={e => upd("realizedGainPct", Number(e.target.value))} type="number" /></Field>
       </div>
       {gain > 0 && <div style={{ fontSize:11, color:C.orange }}>{"Embedded gain: "}{fmtD(gain, true)}</div>}
       {((a.divYieldPct||0) > 0 || (a.realizedGainPct||0) !== 0) && <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
@@ -688,31 +712,31 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
         {"Layer 1: Balance Sheet"}
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
-        <Field label="Current NAV"><Input value={a.nav||0} onChange={e => upd("nav", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Cost Basis"><Input value={a.costBasis||0} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Adj. Tax Basis"><Input value={a.adjBasis||0} onChange={e => upd("adjBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Current NAV"><Input value={a.nav} onChange={e => upd("nav", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Cost Basis"><Input value={a.costBasis} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Adj. Tax Basis"><Input value={a.adjBasis} onChange={e => upd("adjBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
-        <Field label="Unfunded"><Input value={a.unfunded||0} onChange={e => upd("unfunded", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Total Return %"><Input value={a.totalReturnPct||0} onChange={e => upd("totalReturnPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Unfunded"><Input value={a.unfunded} onChange={e => upd("unfunded", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Total Return %"><Input value={a.totalReturnPct} onChange={e => upd("totalReturnPct", Number(e.target.value))} type="number" /></Field>
         <div style={{ display:"flex", flexDirection:"column", justifyContent:"flex-end" }}>
           {gain > 0 && <div style={{ fontSize:11, color:C.orange, fontFamily:"'IBM Plex Mono',monospace" }}>Gain: {fmtD(gain, true)}</div>}
         </div>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Mgmt Fee %"><Input value={a.mgmtFee||0} onChange={e => upd("mgmtFee", Number(e.target.value))} type="number" /></Field>
-        <Field label="Perf Fee %"><Input value={a.perfFee||0} onChange={e => upd("perfFee", Number(e.target.value))} type="number" /></Field>
+        <Field label="Mgmt Fee %"><Input value={a.mgmtFee} onChange={e => upd("mgmtFee", Number(e.target.value))} type="number" /></Field>
+        <Field label="Perf Fee %"><Input value={a.perfFee} onChange={e => upd("perfFee", Number(e.target.value))} type="number" /></Field>
       </div>
       <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
         {"Layer 2: Tax (Recognized % of NAV)"}
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
-        <Field label="Ordinary %"><Input value={a.ordPct||0} onChange={e => upd("ordPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="STCG %"><Input value={a.stcgPct||0} onChange={e => upd("stcgPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="LTCG %"><Input value={a.ltcgPct||0} onChange={e => upd("ltcgPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="Qual Div %"><Input value={a.qualDivPct||0} onChange={e => upd("qualDivPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="Interest %"><Input value={a.intPct||0} onChange={e => upd("intPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="Tax-Exempt %"><Input value={a.taxExPct||0} onChange={e => upd("taxExPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Ordinary %"><Input value={a.ordPct} onChange={e => upd("ordPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="STCG %"><Input value={a.stcgPct} onChange={e => upd("stcgPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="LTCG %"><Input value={a.ltcgPct} onChange={e => upd("ltcgPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Qual Div %"><Input value={a.qualDivPct} onChange={e => upd("qualDivPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Interest %"><Input value={a.intPct} onChange={e => upd("intPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Tax-Exempt %"><Input value={a.taxExPct} onChange={e => upd("taxExPct", Number(e.target.value))} type="number" /></Field>
       </div>
       <div style={{ background:C.surface2, borderRadius:6, padding:10, fontSize:11 }}>
         <div style={{ display:"flex", justifyContent:"space-between", color:C.textDim }}>
@@ -729,24 +753,24 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
         {"Layer 3: Cash Flow"}
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Distribution % NAV"><Input value={a.distPct||0} onChange={e => upd("distPct", Number(e.target.value))} type="number" /></Field>
-        <Field label="Cap Call % Unfunded"><Input value={a.capCallPct||0} onChange={e => upd("capCallPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Distribution % NAV"><Input value={a.distPct} onChange={e => upd("distPct", Number(e.target.value))} type="number" /></Field>
+        <Field label="Cap Call % Unfunded"><Input value={a.capCallPct} onChange={e => upd("capCallPct", Number(e.target.value))} type="number" /></Field>
       </div>
     </>}
 
     {/* Real Estate */}
     {a.assetType==="realEstate" && <>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
-        <Field label="Fair Market Value"><Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
-        <Field label="Cost Basis"><Input value={a.costBasis||0} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Fair Market Value"><Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" /></Field>
+        <Field label="Cost Basis"><Input value={a.costBasis} onChange={e => upd("costBasis", Number(e.target.value))} type="number" prefix="$" /></Field>
       </div>
-      <Field label="Mortgage Balance"><Input value={a.mortgage||0} onChange={e => upd("mortgage", Number(e.target.value))} type="number" prefix="$" /></Field>
+      <Field label="Mortgage Balance"><Input value={a.mortgage} onChange={e => upd("mortgage", Number(e.target.value))} type="number" prefix="$" /></Field>
       {gain > 0 && <div style={{ fontSize:11, color:C.orange }}>{"Embedded gain: "}{fmtD(gain, true)}</div>}
     </>}
 
     {/* Retirement */}
     {a.assetType==="retirement" && <Field label="Balance">
-      <Input value={a.value||0} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" />
+      <Input value={a.value} onChange={e => upd("value", Number(e.target.value))} type="number" prefix="$" />
     </Field>}
 
     <div style={{ display:"flex", gap:8, marginTop:8 }}>
@@ -1211,30 +1235,40 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result 
 
 function CashFlowTab({ profile, streams, result }) {
   const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, [], result), [profile, streams, result]);
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.debtSvc+m.capCall+m.withholding)));
+  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.debtSvc+m.capCall+m.withholding+m.entityDeduc)));
   const barH = 140;
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-    <SectionHeader sub="Gross income -> withholding -> net deposit -> outflows">{"12-Month Cash Flow"}</SectionHeader>
+    <SectionHeader sub="Gross income -> entity deductions -> net deposit -> outflows">{"12-Month Cash Flow"}</SectionHeader>
     {/* Annual summary */}
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(5, 1fr)", gap:10 }}>
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(6, 1fr)", gap:8 }}>
       {[
         {l:"Gross Income",v:monthly.reduce((t,m)=>t+m.grossIn,0),c:C.text},
+        {l:"Entity Deductions",v:(result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0),c:C.accent},
         {l:"Withholding",v:result.totalWithholding,c:C.orange},
         {l:"Est. Tax Pmts",v:result.totalEstPaid,c:C.red},
         {l:"Net Deposits",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:C.green},
         {l:"Year-End Cum.",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?C.green:C.red},
       ].map((x,i) => (
-        <Card key={i} style={{ padding:"12px 14px" }}>
-          <div style={{ fontSize:8, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:4 }}>{x.l}</div>
-          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:14, color:x.c }}>{fmtD(x.v, true)}</div>
+        <Card key={i} style={{ padding:"10px 12px" }}>
+          <div style={{ fontSize:7, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:3 }}>{x.l}</div>
+          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:x.c }}>{fmtD(x.v, true)}</div>
         </Card>
       ))}
     </div>
+    {/* Entity deduction breakdown */}
+    {(result.totalPTET||0) + (result.totalRetirement||0) + (result.totalHealthIns||0) > 0 && <Card style={{ padding:"12px 16px" }}>
+      <div style={{ fontSize:9, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:6 }}>{"Entity-Level Cash Deductions (prorated monthly)"}</div>
+      <div style={{ display:"flex", gap:16, fontSize:11 }}>
+        {(result.totalPTET||0)>0 && <div style={{ color:C.textDim }}>PTE: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.accent }}>{fmtD(result.totalPTET,true)}</span>{" ("}{fmtD(result.totalPTET/12)}{"/mo)"}</div>}
+        {(result.totalRetirement||0)>0 && <div style={{ color:C.textDim }}>Retirement: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.blue }}>{fmtD(result.totalRetirement,true)}</span>{" ("}{fmtD(result.totalRetirement/12)}{"/mo)"}</div>}
+        {(result.totalHealthIns||0)>0 && <div style={{ color:C.textDim }}>Health: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.teal }}>{fmtD(result.totalHealthIns,true)}</span>{" ("}{fmtD(result.totalHealthIns/12)}{"/mo)"}</div>}
+      </div>
+    </Card>}
     {/* Bar chart */}
     <Card style={{ padding: "20px 24px" }}>
       <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[{l:"Net Deposit",c:C.green},{l:"Withholding",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living+Debt",c:C.textDim},{l:"Cap Calls",c:C.purple}]
+        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living+Debt",c:C.textDim},{l:"Cap Calls",c:C.purple}]
           .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:C.textMuted }}>
             <div style={{ width:8, height:8, borderRadius:2, background:x.c }} />{x.l}
           </div>)}
@@ -1242,6 +1276,7 @@ function CashFlowTab({ profile, streams, result }) {
       <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: barH + 60 }}>
         {monthly.map((m, i) => {
           const incH = maxVal>0 ? (m.cashIn/maxVal)*barH : 0;
+          const entH = maxVal>0 ? (m.entityDeduc/maxVal)*barH : 0;
           const whH = maxVal>0 ? (m.withholding/maxVal)*barH : 0;
           const taxH = maxVal>0 ? (m.estPmt/maxVal)*barH : 0;
           const expH = maxVal>0 ? ((m.livingExp+m.debtSvc)/maxVal)*barH : 0;
@@ -1252,6 +1287,7 @@ function CashFlowTab({ profile, streams, result }) {
             </div>
             <div style={{ width:"100%", display:"flex", flexDirection:"column", gap:1 }}>
               <div style={{ height:incH, background:C.green+"88", borderRadius:"3px 3px 0 0", minHeight:incH>0?2:0 }} />
+              <div style={{ height:entH, background:C.accent+"66", minHeight:entH>0?2:0 }} />
               <div style={{ height:whH, background:C.orange+"66", minHeight:whH>0?2:0 }} />
               <div style={{ height:taxH, background:C.red+"88", minHeight:taxH>0?2:0 }} />
               <div style={{ height:expH, background:C.textDim+"44", minHeight:expH>0?2:0 }} />
@@ -1266,12 +1302,12 @@ function CashFlowTab({ profile, streams, result }) {
 
     {/* Detail table */}
     <Card style={{ padding: "20px 24px", overflowX: "auto" }}>
-      <SectionHeader sub="Gross -> W/H -> Net In -> Outflows">{"Detail Schedule"}</SectionHeader>
+      <SectionHeader sub="Gross -> W/H -> Entity Ded -> Net In -> Outflows">{"Detail Schedule"}</SectionHeader>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${C.borderLight}` }}>
-            {["Month","Gross In","W/H","Net In","Est. Tax","Living","Debt","Calls","Net","Cum."].map(h =>
-              <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:8, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
+            {["Month","Gross In","W/H","Ent. Ded","Net In","Est. Tax","Living","Debt","Calls","Net","Cum."].map(h =>
+              <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:7, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
             )}
           </tr>
         </thead>
@@ -1279,9 +1315,9 @@ function CashFlowTab({ profile, streams, result }) {
           {monthly.map((m,i) => (
             <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
               <td style={{ padding:"6px 4px", color:C.text, fontSize:11 }}>{m.month}{m.qDue ? <span style={{ fontSize:8, color:C.red, marginLeft:3 }}>({m.qDue})</span> : ""}</td>
-              {[m.grossIn, m.withholding, m.cashIn, m.estPmt, m.livingExp, m.debtSvc, m.capCall, m.net, m.cumulative].map((v,j) =>
-                <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10.5,
-                  color: j===1?C.orange : j>=7?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
+              {[m.grossIn, m.withholding, m.entityDeduc, m.cashIn - m.entityDeduc, m.estPmt, m.livingExp, m.debtSvc, m.capCall, m.net, m.cumulative].map((v,j) =>
+                <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10,
+                  color: j===1?C.orange : j===2?C.accent : j>=8?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
               )}
             </tr>
           ))}
@@ -1352,11 +1388,11 @@ function EntitiesTab({ entities, setEntities }) {
                 {"PTE / SALT workaround election"}
               </label>
               {e.pteElection && <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-                <Field label="PTE Rate %"><Input value={e.pteRate||0} onChange={ev => updEntity(e.id, "pteRate", Number(ev.target.value))} type="number" /></Field>
+                <Field label="PTE Rate %"><Input value={e.pteRate} onChange={ev => updEntity(e.id, "pteRate", Number(ev.target.value))} type="number" /></Field>
                 <Field label="PTE State"><Input value={e.pteState||""} onChange={ev => updEntity(e.id, "pteState", ev.target.value)} /></Field>
               </div>}
-              <Field label="Retirement Contributions (annual)"><Input value={e.retirementContrib||0} onChange={ev => updEntity(e.id, "retirementContrib", Number(ev.target.value))} type="number" prefix="$" /></Field>
-              <Field label="Health Insurance (annual, deductible)"><Input value={e.healthInsurance||0} onChange={ev => updEntity(e.id, "healthInsurance", Number(ev.target.value))} type="number" prefix="$" /></Field>
+              <Field label="Retirement Contributions (annual)"><Input value={e.retirementContrib} onChange={ev => updEntity(e.id, "retirementContrib", Number(ev.target.value))} type="number" prefix="$" /></Field>
+              <Field label="Health Insurance (annual, deductible)"><Input value={e.healthInsurance} onChange={ev => updEntity(e.id, "healthInsurance", Number(ev.target.value))} type="number" prefix="$" /></Field>
               <Field label="Notes"><Input value={e.notes} onChange={ev => updEntity(e.id, "notes", ev.target.value)} placeholder="Filing notes, EIN, etc." /></Field>
               <Btn variant="danger" onClick={() => delEntity(e.id)} style={{ marginTop: 4 }}>Delete Entity</Btn>
             </div>
