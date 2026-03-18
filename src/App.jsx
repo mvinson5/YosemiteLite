@@ -2203,7 +2203,7 @@ export default function YosemitePlatform() {
   const resetAll = () => { setProfile(PRELOAD_PROFILE); setStreams(PRELOAD_STREAMS); setAssets(PRELOAD_ASSETS); setDeds(PRELOAD_DEDUCTIONS); setEntities(PRELOAD_ENTITIES); setLiabs(PRELOAD_LIABILITIES); };
   const clearAll = () => { setProfile(DEFAULT_PROFILE); setStreams([]); setAssets([]); setDeds([]); setEntities([]); setLiabs([]); };
 
-  return <div style={{ background: C.bg, height: "100vh", overflow: "hidden", fontFamily: "'Inter',system-ui,sans-serif", color: C.text, display: "flex" }}>
+  return <div id="yosemite-root" style={{ background: C.bg, height: "100vh", overflow: "hidden", fontFamily: "'Inter',system-ui,sans-serif", color: C.text, display: "flex" }}>
     <style>{`
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
       @import url('https://api.fontshare.com/v2/css?f[]=erode@400,500,600&display=swap');
@@ -2213,9 +2213,11 @@ export default function YosemitePlatform() {
       select option{background:#FFFFFF;}
       @keyframes slideIn{from{transform:translateX(100%)}to{transform:translateX(0)}}
       @media print {
-        body { margin:0; }
+        body { margin:0; padding:0; }
         .no-print { display:none !important; }
-        #yosemite-report { position:static !important; overflow:visible !important; }
+        #yosemite-root > *:not(#yosemite-report) { display:none !important; }
+        #yosemite-report { position:static !important; overflow:visible !important; height:auto !important; }
+        @page { margin: 0.5in; }
       }
     `}</style>
 
