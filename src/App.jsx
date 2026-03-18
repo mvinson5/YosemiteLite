@@ -349,9 +349,9 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     const a = (s.amount||0) * pf;
     streamCashIn += a - a * ((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0)) / 100;
   });
-  // Step B: Cash from entities with actualDistributions
+  // Step B: Cash from entities with actualDistributions (only if they have income streams)
   let distCashIn = 0;
-  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0) distCashIn += e.actualDistributions; });
+  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0 && k1ByEntity[e.label]) distCashIn += e.actualDistributions; });
   // Step C: Cash from assets (only actual cash, not phantom K-1 income)
   let assetCashIn = 0;
   assets.forEach(item => {
@@ -452,14 +452,17 @@ function computeMonthlyCashflow(profile, streams, assets, result, liabilities, e
   (entities||[]).forEach(e => { entMap[e.label] = e; });
 
   // Entities with actualDistributions: compute monthly distribution schedule
+  // Only if the annual engine confirmed distributions (i.e., entity has income streams)
   const distSchedule = {};
-  (entities||[]).forEach(e => {
-    if ((e.actualDistributions||0) > 0) {
-      const dMonths = e.distributionMonths || [2,5,8,11];
-      const perMonth = e.actualDistributions / dMonths.length;
-      dMonths.forEach(m => { distSchedule[m] = (distSchedule[m]||0) + perMonth; });
-    }
-  });
+  if ((result.distCashIn||0) > 0) {
+    (entities||[]).forEach(e => {
+      if ((e.actualDistributions||0) > 0) {
+        const dMonths = e.distributionMonths || [2,5,8,11];
+        const perMonth = e.actualDistributions / dMonths.length;
+        dMonths.forEach(m => { distSchedule[m] = (distSchedule[m]||0) + perMonth; });
+      }
+    });
+  }
 
   // Entity deductions for non-actualDist entities, prorated monthly
   const entDeducMonthly = (result.entityDeducNonDist||0) / 12;
@@ -1622,7 +1625,7 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     const qMap={3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
     const livingExp=profile.livingExpenses||0;
     const entMap2={};(entities||[]).forEach(e=>{entMap2[e.label]=e;});
-    const dSched={};(entities||[]).forEach(e=>{if((e.actualDistributions||0)>0){const dm=e.distributionMonths||[2,5,8,11];const pm=e.actualDistributions/dm.length;dm.forEach(m=>{dSched[m]=(dSched[m]||0)+pm;});}});
+    const dSched={};if((result.distCashIn||0)>0){(entities||[]).forEach(e=>{if((e.actualDistributions||0)>0){const dm=e.distributionMonths||[2,5,8,11];const pm=e.actualDistributions/dm.length;dm.forEach(m=>{dSched[m]=(dSched[m]||0)+pm;});}});}
     const edM=(result.entityDeducNonDist||0)/12;
     const acM=(result.assetCashIn||0)/12;
     let cum=0;
