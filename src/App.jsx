@@ -1567,6 +1567,230 @@ function EntitiesTab({ entities, setEntities }) {
   </div>;
 }
 
+// ─── PRINT REPORT ───────────────────────────────────────────────────────────
+function ReportView({ profile, result, bs, streams, assets, entities, liabilities, onClose }) {
+  const navy = "#0F1A2E";
+  const mint = "#3DDBB4";
+  const pg = { padding:"48px 56px", pageBreakAfter:"always", position:"relative" };
+  const hdr = { fontFamily:"'Erode',Georgia,serif", fontSize:11, color:navy, letterSpacing:"0.2em", textTransform:"uppercase", borderBottom:`2px solid ${navy}`, paddingBottom:6, marginBottom:16 };
+  const mono = { fontFamily:"'IBM Plex Mono',monospace" };
+  const row = (l,v,opts={}) => <div style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:`1px solid #E8E5DE`, ...(opts.bold?{fontWeight:600}:{}), ...(opts.style||{}) }}>
+    <span style={{ fontSize:11, color:opts.dim?"#8A8680":"#1A1C20" }}>{l}</span>
+    <span style={{ ...mono, fontSize:11, color:opts.color||"#1A1C20" }}>{v}</span>
+  </div>;
+  const thead = (cols) => <tr style={{ borderBottom:`2px solid ${navy}` }}>{cols.map((c,i) => <th key={i} style={{ textAlign:i===0?"left":"right", padding:"6px 8px", fontSize:9, color:navy, letterSpacing:"0.12em", textTransform:"uppercase", fontWeight:500 }}>{c}</th>)}</tr>;
+  const td = (v,opts={}) => <td style={{ padding:"5px 8px", textAlign:opts.left?"left":"right", ...mono, fontSize:10, color:opts.color||"#1A1C20", ...(opts.style||{}) }}>{v}</td>;
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+  // Compute monthly CF for page 5
+  const monthly = (() => {
+    const qMap={3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
+    const livingExp=profile.livingExpenses||0;
+    const entDM=((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0))/12;
+    const frM=(result.firmRetention||0)/12;
+    const reCFM=(result.reCashFlow||0)/12;
+    let cum=0;
+    return months.map((m,i) => {
+      let g=0,w=0;
+      streams.forEach(s=>{const sm=s.startMonth??0,em=s.endMonth??11;if(i<sm||i>em)return;const t=s.timing||"monthly";let a=0;if(t==="monthly")a=(s.amount||0)/12;else if(t==="quarterly"&&[2,5,8,11].includes(i))a=(s.amount||0)/4;else if(t==="annual"&&i===(s.timingMonth??11))a=s.amount||0;else if(t==="semi"&&[5,11].includes(i))a=(s.amount||0)/2;g+=a;w+=a*((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0))/100;});
+      if([5,11].includes(i))g+=result.invDistributions/2;
+      g+=reCFM;
+      const ci=g-w;let ep=0;if(qMap[i]!==undefined)ep=profile[qMap[i]]||0;
+      let cc=0;if([2,5,8,11].includes(i))cc=result.invCapCalls/4;
+      let lp=0;(liabilities||[]).forEach(l=>{const sm=l.startMonth??0,em=l.endMonth??11;if(i>=sm&&i<=em)lp+=(l.monthlyPayment||0);});
+      const n=ci-livingExp-lp-ep-cc-entDM-frM;cum+=n;
+      return {month:m,grossIn:g,withholding:w,cashIn:ci,estPmt:ep,livingExp,liabPmt:lp,capCall:cc,entDeduc:entDM,firmRet:frM,net:n,cumulative:cum};
+    });
+  })();
+
+  // Asset-derived income for page 2
+  const assetIncome = (assets||[]).map(a => {
+    const items=[];const at=a.assetType;const pf=((a.endMonth??11)-(a.startMonth??0)+1)/12;
+    if(at==="cash"&&(a.yieldPct||0)>0) items.push({src:a.label,char:"Interest",amt:(a.value||0)*(a.yieldPct||0)/100*pf});
+    else if(at==="security"){if((a.divYieldPct||0)>0)items.push({src:a.label,char:"Qual. Div",amt:(a.value||0)*(a.divYieldPct||0)/100*pf});if((a.realizedGainPct||0)!==0)items.push({src:a.label,char:"LTCG",amt:(a.value||0)*(a.realizedGainPct||0)/100*pf});}
+    else if(at==="hedgeFund"||at==="peFund"){const n=a.nav||0;if((a.ordPct||0)+(a.intPct||0)!==0)items.push({src:a.label,char:"Ordinary",amt:n*((a.ordPct||0)+(a.intPct||0))/100*pf});if((a.stcgPct||0)!==0)items.push({src:a.label,char:"STCG",amt:n*(a.stcgPct||0)/100*pf});if((a.ltcgPct||0)!==0)items.push({src:a.label,char:"LTCG",amt:n*(a.ltcgPct||0)/100*pf});if((a.qualDivPct||0)!==0)items.push({src:a.label,char:"Qual. Div",amt:n*(a.qualDivPct||0)/100*pf});if((a.taxExPct||0)!==0)items.push({src:a.label,char:"Tax-Exempt",amt:n*(a.taxExPct||0)/100*pf});}
+    else if(at==="realEstate"&&(a.taxableIncome||0)!==0)items.push({src:a.label,char:"Passive",amt:(a.taxableIncome||0)*pf});
+    return items;
+  }).flat();
+
+  return <div id="yosemite-report" style={{ position:"fixed", inset:0, zIndex:200, background:"white", overflow:"auto", fontFamily:"'Inter',system-ui,sans-serif", color:"#1A1C20" }}>
+    {/* Print controls (hidden in print) */}
+    <div className="no-print" style={{ position:"sticky", top:0, zIndex:10, background:navy, padding:"12px 24px", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+      <span style={{ color:"white", fontSize:13 }}>{"Report Preview"}</span>
+      <div style={{ display:"flex", gap:8 }}>
+        <button onClick={() => window.print()} style={{ padding:"6px 20px", background:mint, color:navy, border:"none", borderRadius:4, fontSize:12, fontWeight:600, cursor:"pointer", fontFamily:"inherit" }}>Print / Save PDF</button>
+        <button onClick={onClose} style={{ padding:"6px 20px", background:"transparent", color:"white", border:`1px solid rgba(255,255,255,0.3)`, borderRadius:4, fontSize:12, cursor:"pointer", fontFamily:"inherit" }}>Close</button>
+      </div>
+    </div>
+
+    {/* PAGE 1: Executive Summary */}
+    <div style={pg}>
+      <div style={{ marginBottom:32 }}>
+        <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:28, color:navy, marginBottom:4 }}>Yosemite</div>
+        <div style={{ fontSize:10, color:"#8A8680", letterSpacing:"0.15em", textTransform:"uppercase" }}>{"Tax Planning Summary | "}{new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"})}</div>
+      </div>
+      <div style={{ display:"flex", justifyContent:"space-between", marginBottom:24, padding:"16px 20px", background:"#F8F7F4", borderRadius:6 }}>
+        <div><div style={{ fontSize:9, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase" }}>Household</div><div style={{ fontSize:16, color:navy, fontWeight:500, marginTop:2 }}>{profile.name || "Client"}</div></div>
+        <div><div style={{ fontSize:9, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase" }}>Filing</div><div style={{ fontSize:14, marginTop:2 }}>{profile.filingStatus?.toUpperCase()}</div></div>
+        <div><div style={{ fontSize:9, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase" }}>State</div><div style={{ fontSize:14, marginTop:2 }}>{profile.state}</div></div>
+        <div><div style={{ fontSize:9, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase" }}>Tax Year</div><div style={{ fontSize:14, marginTop:2 }}>2025</div></div>
+      </div>
+      <div style={hdr}>Key Metrics</div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16, marginBottom:24 }}>
+        {[{l:"Adjusted Gross Income",v:fmtD(result.agi,true)},{l:"Federal Tax",v:fmtD(result.federalTax,true)},{l:"State Tax (after PTE)",v:fmtD(result.stateTaxAfterPTE,true)},
+          {l:"Total Tax Liability",v:fmtD(result.totalTax,true),c:"#C04040"},{l:"Effective Rate",v:pct(result.effectiveRate)},{l:"NIIT",v:fmtD(result.niit,true)},
+          {l:"Net Worth",v:fmtD(bs.netWorth,true),c:navy},{l:"Net Cash After Tax",v:fmtD(result.netCashAfterTax,true),c:result.netCashAfterTax>=0?"#2D8060":"#C04040"},{l:"Marginal Rate (Ord.)",v:pct(result.marginalOrd)},
+        ].map((k,i) => <div key={i} style={{ padding:"12px 14px", border:"1px solid #DCD9D0", borderRadius:6 }}>
+          <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:4 }}>{k.l}</div>
+          <div style={{ ...mono, fontSize:18, color:k.c||navy }}>{k.v}</div>
+        </div>)}
+      </div>
+      {result.phantomIncome > 0 && <div style={{ padding:"12px 16px", background:"#FDF4F4", border:"1px solid #E8CCCC", borderRadius:6, marginBottom:16 }}>
+        <div style={{ fontSize:9, color:"#C04040", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:4 }}>Phantom Income</div>
+        <div style={{ fontSize:11, color:"#6B6860" }}>K-1 taxable income ({fmtD(result.totalGrossK1ForDistEnts,true)}) exceeds actual distributions ({fmtD(result.totalActualDist,true)}) by <strong>{fmtD(result.phantomIncome,true)}</strong>. Tax is owed on income retained by the firm.</div>
+      </div>}
+      {result.totalPTET > 0 && <div style={{ padding:"12px 16px", background:"#F0FAF6", border:"1px solid #C8E8DC", borderRadius:6 }}>
+        <div style={{ fontSize:9, color:"#2D8060", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:4 }}>SALT Workaround</div>
+        <div style={{ fontSize:11, color:"#6B6860" }}>PTE election generates {fmtD(result.totalPTET,true)} in entity-level state tax, providing ~{fmtD(result.pteFedSavings,true)} in federal savings by bypassing the $10K SALT cap.</div>
+      </div>}
+    </div>
+
+    {/* PAGE 2: Income Summary */}
+    <div style={pg}>
+      <div style={hdr}>Income Summary</div>
+      <div style={{ fontSize:12, color:navy, fontWeight:500, marginBottom:8 }}>Income Streams</div>
+      <table style={{ width:"100%", borderCollapse:"collapse", marginBottom:20 }}>
+        <thead>{thead(["Source","Type","Entity","Annual"])}</thead>
+        <tbody>{streams.map((s,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE" }}>
+          <td style={{ padding:"5px 8px", fontSize:10 }}>{s.label||INCOME_TYPES[s.type]?.label}</td>
+          <td style={{ padding:"5px 8px", fontSize:10 }}>{INCOME_TYPES[s.type]?.label||s.type}</td>
+          <td style={{ padding:"5px 8px", fontSize:10, color:"#8A8680" }}>{s.entity}</td>
+          {td(fmtD(s.amount,true))}
+        </tr>)}</tbody>
+      </table>
+      <div style={{ fontSize:12, color:navy, fontWeight:500, marginBottom:8 }}>Asset-Derived Income</div>
+      <table style={{ width:"100%", borderCollapse:"collapse", marginBottom:20 }}>
+        <thead>{thead(["Source","Character","Annual"])}</thead>
+        <tbody>{assetIncome.map((a,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE" }}>
+          <td style={{ padding:"5px 8px", fontSize:10 }}>{a.src}</td>
+          <td style={{ padding:"5px 8px", fontSize:10 }}>{a.char}</td>
+          {td(fmtD(a.amt,true),{color:a.amt<0?"#2D8060":"#1A1C20"})}
+        </tr>)}</tbody>
+      </table>
+      <div style={{ fontSize:12, color:navy, fontWeight:500, marginBottom:8 }}>Income by Character</div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
+        {[{l:"Ordinary (Earned)",v:result.ordEarned},{l:"Ordinary (Investment)",v:result.ordInv},{l:"LTCG (after netting)",v:result.netLTAfter},{l:"Qualified Dividends",v:result.qualDiv},
+          {l:"STCG (after netting)",v:result.netSTAfter},{l:"Passive",v:result.passiveAllowed},{l:"Tax-Exempt",v:result.taxExempt},{l:"Suspended PAL",v:result.suspendedPAL},
+        ].map((k,i) => <div key={i} style={{ padding:8, border:"1px solid #E8E5DE", borderRadius:4 }}>
+          <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.1em", textTransform:"uppercase" }}>{k.l}</div>
+          <div style={{ ...mono, fontSize:13, color:k.v<0?"#2D8060":"#1A1C20", marginTop:2 }}>{fmtD(k.v,true)}</div>
+        </div>)}
+      </div>
+    </div>
+
+    {/* PAGE 3: Tax Computation */}
+    <div style={pg}>
+      <div style={hdr}>Tax Computation Waterfall</div>
+      {result.preTaxDeductions > 0 && <><div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Entity Pre-Tax Deductions</div>
+        {row("PTET (entity-level state tax)", fmtD(result.totalPTET,true), {color:mint})}
+        {row("Retirement Contributions", fmtD(result.totalRetirement,true), {color:"#2E5C94"})}
+        {row("Self-Employed Health Insurance", fmtD(result.totalHealthIns,true), {color:"#2A7878"})}
+        {row("Total Pre-Tax Deductions", fmtD(result.preTaxDeductions + result.totalHealthIns,true), {bold:true})}
+        <div style={{ height:16 }} /></>}
+      <div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Adjusted Gross Income</div>
+      {row("Total Ordinary Income", fmtD(result.totalOrdinary,true))}
+      {row("Total Preferential Income (LTCG + QDiv)", fmtD(result.totalPref,true))}
+      {row("Adjusted Gross Income", fmtD(result.agi,true), {bold:true})}
+      <div style={{ height:16 }} />
+      <div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Deductions</div>
+      {row(result.useItemized ? "Itemized Deductions" : "Standard Deduction", fmtD(result.deductionAmt,true))}
+      {result.schedAInterest > 0 && row("  incl. Mortgage Interest (from liabilities)", fmtD(result.schedAInterest,true), {dim:true})}
+      {result.qbiDeduction > 0 && row("  incl. QBI Deduction", fmtD(result.qbiDeduction,true), {dim:true})}
+      <div style={{ height:16 }} />
+      <div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Tax Liability</div>
+      {row("Ordinary Tax (brackets)", fmtD(result.ordTax,true))}
+      {row("Preferential Tax (LTCG/QDiv rates)", fmtD(result.prefTax,true))}
+      {row("Net Investment Income Tax (3.8%)", fmtD(result.niit,true))}
+      {row("Federal Tax", fmtD(result.federalTax,true), {bold:true, color:"#C04040"})}
+      <div style={{ height:8 }} />
+      {row("State Tax (gross)", fmtD(result.stateTax,true))}
+      {result.totalPTET > 0 && row("Less: PTE Credit", `(${fmtD(result.totalPTET,true)})`, {color:"#2D8060"})}
+      {row("State Tax (net of PTE)", fmtD(result.stateTaxAfterPTE,true), {bold:true})}
+      <div style={{ height:8 }} />
+      {row("TOTAL TAX LIABILITY", fmtD(result.totalTax,true), {bold:true, color:"#C04040", style:{borderBottom:`2px solid ${navy}`, paddingBottom:8}})}
+      {row("Effective Rate", pct(result.effectiveRate), {dim:true})}
+      <div style={{ height:16 }} />
+      <div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Payment Status</div>
+      {row("Federal Withholding", fmtD(result.totalFedWithholding,true))}
+      {row("Estimated Tax Payments", fmtD(result.totalEstPaid,true))}
+      {row("Total Prepaid", fmtD(result.totalPrepaid,true), {bold:true})}
+      {row(result.balanceDueFed>0?"Federal Balance Due":"Federal Overpayment", fmtD(result.balanceDueFed>0?result.balanceDueFed:result.overpaymentFed,true), {color:result.balanceDueFed>0?"#C04040":"#2D8060", bold:true})}
+    </div>
+
+    {/* PAGE 4: Balance Sheet */}
+    <div style={pg}>
+      <div style={hdr}>Balance Sheet</div>
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20 }}>
+        {[{l:"Total Assets",v:fmtD(bs.totalAssets,true)},{l:"Total Liabilities",v:fmtD(bs.totalLiabilities,true),c:"#C04040"},{l:"Net Worth",v:fmtD(bs.netWorth,true),c:navy}].map((k,i) =>
+          <div key={i} style={{ padding:"14px 16px", border:"1px solid #DCD9D0", borderRadius:6 }}>
+            <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:4 }}>{k.l}</div>
+            <div style={{ ...mono, fontSize:20, color:k.c||"#1A1C20" }}>{k.v}</div>
+          </div>
+        )}
+      </div>
+      {[{t:"Tier 1: Cash",k:"1"},{t:"Tier 2: Liquid Securities",k:"2"},{t:"Tier 3: Hedge Funds",k:"3"},{t:"Tier 4: PE/VC + Real Estate",k:"4"},{t:"Retirement",k:"R"}].map(tier => {
+        const ta = assets.filter(a => {const m={cash:"1",security:"2",hedgeFund:"3",peFund:"4",realEstate:"4",retirement:"R"};return m[a.assetType]===tier.k;});
+        if (ta.length===0) return null;
+        return <div key={tier.k} style={{ marginBottom:12 }}>
+          <div style={{ fontSize:10, color:navy, fontWeight:500, marginBottom:4 }}>{tier.t} ({fmtD(bs.tiers[tier.k],true)})</div>
+          <table style={{ width:"100%", borderCollapse:"collapse" }}>
+            <thead>{thead(["Asset","Entity","Value","Basis","Gain"])}</thead>
+            <tbody>{ta.map((a,i) => {const v=(a.assetType==="hedgeFund"||a.assetType==="peFund")?a.nav||0:a.value||0;const b=a.adjBasis||a.costBasis||0;return <tr key={i} style={{ borderBottom:"1px solid #E8E5DE" }}>
+              <td style={{ padding:"4px 8px", fontSize:10 }}>{a.label}</td>
+              <td style={{ padding:"4px 8px", fontSize:9, color:"#8A8680" }}>{a.entity}</td>
+              {td(fmtD(v,true))}{td(fmtD(b,true),{color:"#8A8680"})}{td(fmtD(v-b,true),{color:v-b>0?"#A86838":"#2D8060"})}
+            </tr>;})}</tbody>
+          </table>
+        </div>;
+      })}
+      {(liabilities||[]).length > 0 && <div style={{ marginTop:12 }}>
+        <div style={{ fontSize:10, color:navy, fontWeight:500, marginBottom:4 }}>Liabilities</div>
+        <table style={{ width:"100%", borderCollapse:"collapse" }}>
+          <thead>{thead(["Liability","Balance","Mo. Payment","Ann. Interest","Deductibility"])}</thead>
+          <tbody>{(liabilities||[]).map((l,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE" }}>
+            <td style={{ padding:"4px 8px", fontSize:10 }}>{l.label}</td>
+            {td(fmtD(l.balance,true),{color:"#C04040"})}{td(fmtD(l.monthlyPayment))}{td(fmtD(l.annualInterest))}
+            <td style={{ padding:"4px 8px", fontSize:9, color:"#8A8680" }}>{l.deductType==="schedA"?"Sched A":l.deductType==="schedE"?"Sched E":l.deductType==="investment"?"Inv. Interest":"Non-deductible"}</td>
+          </tr>)}</tbody>
+        </table>
+      </div>}
+    </div>
+
+    {/* PAGE 5: Cash Flow Schedule */}
+    <div style={{...pg, pageBreakAfter:"auto"}}>
+      <div style={hdr}>12-Month Cash Flow Schedule</div>
+      <table style={{ width:"100%", borderCollapse:"collapse" }}>
+        <thead>{thead(["Month","Gross In","W/H","Ent. Ded","Firm Ret","Est. Tax","Living","Liab.","Calls","Net","Cumulative"])}</thead>
+        <tbody>{monthly.map((m,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE", background:i%2===0?"#FAFAF8":"transparent" }}>
+          <td style={{ padding:"4px 8px", fontSize:10 }}>{m.month}</td>
+          {td(fmtD(m.grossIn))}{td(fmtD(m.withholding),{color:"#A86838"})}{td(fmtD(m.entDeduc))}{td(fmtD(m.firmRet))}{td(fmtD(m.estPmt),{color:"#C04040"})}{td(fmtD(m.livingExp))}{td(fmtD(m.liabPmt))}{td(fmtD(m.capCall))}
+          {td(fmtD(m.net),{color:m.net>=0?"#2D8060":"#C04040"})}{td(fmtD(m.cumulative),{color:m.cumulative>=0?"#2D8060":"#C04040"})}
+        </tr>)}</tbody>
+      </table>
+      <div style={{ marginTop:20, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
+        {[{l:"Total Gross Income",v:monthly.reduce((t,m)=>t+m.grossIn,0)},{l:"Total Tax + W/H",v:monthly.reduce((t,m)=>t+m.estPmt+m.withholding,0),c:"#C04040"},{l:"Total Entity Deductions",v:(result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)},{l:"Year-End Cumulative",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?"#2D8060":"#C04040"}]
+          .map((k,i) => <div key={i} style={{ padding:10, border:"1px solid #DCD9D0", borderRadius:4 }}>
+            <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.1em", textTransform:"uppercase" }}>{k.l}</div>
+            <div style={{ ...mono, fontSize:14, color:k.c||"#1A1C20", marginTop:2 }}>{fmtD(k.v,true)}</div>
+          </div>)}
+      </div>
+      <div style={{ marginTop:24, fontSize:9, color:"#B0ACA4", textAlign:"center" }}>
+        {"Prepared by Yosemite | For planning purposes only | Not tax advice"}
+      </div>
+    </div>
+  </div>;
+}
+
 // ─── SCENARIO ANALYSIS ──────────────────────────────────────────────────────
 const SCENARIO_PRESETS = [
   { id:"s_strong", label:"Strong Year (+$400K)", desc:"K-1 profit allocation up $400K",
@@ -1961,6 +2185,7 @@ export default function YosemitePlatform() {
   const [entities, setEntities] = useState(PRELOAD_ENTITIES);
   const [liabilities, setLiabs] = useState(PRELOAD_LIABILITIES);
   const [panel, setPanel] = useState(null);
+  const [showReport, setShowReport] = useState(false);
 
   const updProfile = (k, v) => setProfile(p => ({ ...p, [k]: v }));
   const result = useMemo(() => computeTax(profile, streams, assets, deductions, entities, liabilities), [profile, streams, assets, deductions, entities, liabilities]);
@@ -1987,6 +2212,11 @@ export default function YosemitePlatform() {
       ::-webkit-scrollbar{width:4px;}::-webkit-scrollbar-thumb{background:#C8C4BC;border-radius:2px;}
       select option{background:#FFFFFF;}
       @keyframes slideIn{from{transform:translateX(100%)}to{transform:translateX(0)}}
+      @media print {
+        body { margin:0; }
+        .no-print { display:none !important; }
+        #yosemite-report { position:static !important; overflow:visible !important; }
+      }
     `}</style>
 
     {/* Sidebar - Navy */}
@@ -2045,6 +2275,11 @@ export default function YosemitePlatform() {
             padding: "5px 8px", color: C.navText, fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 6 }}>
           {"Clear All"}
         </button>
+        <button onClick={() => setShowReport(true)}
+          style={{ display: "block", width: "100%", textAlign: "left", background: C.navActive, border: `1px solid ${C.navBorder}`, borderRadius: 3,
+            padding: "5px 8px", color: "#FFFFFF", fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 6 }}>
+          {"Generate Report"}
+        </button>
         {PERSONA_PRESETS.map((p, i) => (
           <button key={i} onClick={() => applyPersona(p)}
             style={{
@@ -2079,5 +2314,6 @@ export default function YosemitePlatform() {
     <SlidePanel open={panel?.type === "asset"} onClose={() => setPanel(null)} title={panel?.data ? "Edit Asset" : "Add Asset"}>
       <AssetEditor key={panel?.data?.id || "new-asset"} asset={panel?.data} onSave={saveAsset} onDelete={delAsset} entities={entities} />
     </SlidePanel>
+    {showReport && <ReportView profile={profile} result={result} bs={bs} streams={streams} assets={assets} entities={entities} liabilities={liabilities} onClose={() => setShowReport(false)} />}
   </div>;
 }
