@@ -245,7 +245,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     streamCashIn += a - a * ((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0)) / 100;
   });
   let distCashIn = 0;
-  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0) distCashIn += e.actualDistributions; });
+  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0 && k1ByEntity[e.label]) distCashIn += e.actualDistributions; });
   let assetCashIn = 0;
   assets.forEach(item => {
     const pf = proFactor_eng(item); const at = item.assetType;
@@ -897,6 +897,19 @@ const cfMixed = computeTax(
 assert("CF mixed: streamCashIn = 200K (wages only)", cfMixed.streamCashIn, 200000);
 assert("CF mixed: distCashIn = 700K", cfMixed.distCashIn, 700000);
 assert("CF mixed: entityDeducNonDist = 0 (Employer has no deductions)", cfMixed.entityDeducNonDist, 0);
+
+// REGRESSION: entity with actualDistributions but no streams should produce $0 distCashIn
+const cfNoStreams = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 0 },
+  [], // no streams at all
+  [], [],
+  [{ label: "Firm", pteElection: true, pteRate: 9.3, retirementContrib: 100000, healthInsurance: 30000,
+     actualDistributions: 1500000 }],
+  []
+);
+assert("CF no-streams regression: distCashIn = 0", cfNoStreams.distCashIn, 0);
+assert("CF no-streams regression: streamCashIn = 0", cfNoStreams.streamCashIn, 0);
+assert("CF no-streams regression: netCash = 0 (no income)", cfNoStreams.netCashAfterTax, 0);
 
 // ─── TEST 17: MONTHLY CF ENGINE — CASH BASIS ───────────────────────────────
 section("17. Monthly CF Engine — Cash Basis");
