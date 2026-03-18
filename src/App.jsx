@@ -2102,11 +2102,7 @@ const PRELOAD_PROFILE = {
 };
 
 const PRELOAD_STREAMS = [
-  { id:"s1", type:"business", label:"Monthly Draw (BigLaw Test)", amount:300000, timing:"monthly", entity:"Husband", qbi:false,
-    fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s2", type:"business", label:"Quarterly Partner Distribution", amount:2200000, timing:"quarterly", entity:"Husband", qbi:false,
-    fedWithholdingPct:0, stateWithholdingPct:0 },
-  { id:"s3", type:"ltcg", label:"Firm Investment Account Gains", amount:600000, timing:"annual", timingMonth:2, entity:"Husband", qbi:false,
+  { id:"s1", type:"business", label:"K-1 Ordinary - Quarterly Distribution (incl. draw)", amount:2500000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
