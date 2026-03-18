@@ -234,12 +234,35 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
 
   const totalWithholding = totalFedWithholding + totalStateWithholding;
-  const grossIncome = agi + taxExempt;
-  const netAfterWithholding = grossIncome - totalWithholding;
-  const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
-    - totalPTET - totalRetirement - totalHealthIns - firmRetention
-    - (profile.livingExpenses||0)*12 - totalLiabPayments
-    + invDistributions - invCapCalls + reCashFlow;
+
+  // Cash-basis net cash
+  let streamCashIn = 0;
+  streams.forEach(s => {
+    const pf = proFactor_eng(s);
+    const ent = entMap[s.entity];
+    if (ent?.actualDistributions > 0) return;
+    const a = (s.amount||0) * pf;
+    streamCashIn += a - a * ((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0)) / 100;
+  });
+  let distCashIn = 0;
+  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0) distCashIn += e.actualDistributions; });
+  let assetCashIn = 0;
+  assets.forEach(item => {
+    const pf = proFactor_eng(item); const at = item.assetType;
+    if (at==="cash") assetCashIn += (item.value||0)*(item.yieldPct||0)/100*pf;
+    else if (at==="security") assetCashIn += (item.value||0)*(item.divYieldPct||0)/100*pf;
+    else if (at==="realEstate") assetCashIn += (item.netCashFlow||0)*pf;
+  });
+  let entityDeducNonDist = 0;
+  Object.entries(k1ByEntity).forEach(([entityLabel]) => {
+    const ent = entMap[entityLabel];
+    if (!ent || (ent.actualDistributions||0) > 0) return;
+    entityDeducNonDist += (ent.pteElection ? Math.abs(k1ByEntity[entityLabel]||0)*(ent.pteRate||0)/100 : 0)
+      + (ent.retirementContrib||0) + (ent.healthInsurance||0);
+  });
+  const netCashAfterTax = streamCashIn + distCashIn + assetCashIn + invDistributions - invCapCalls
+    - entityDeducNonDist - totalEstPaid - balanceDueFed - balanceDueState
+    - (profile.livingExpenses||0)*12 - totalLiabPayments;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
   const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
@@ -256,6 +279,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     marginalOrd, marginalPref,
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
     totalActualDist, totalGrossK1ForDistEnts, phantomIncome, firmRetention, entityDeducTotal,
+    streamCashIn, distCashIn, assetCashIn, entityDeducNonDist,
     totalFedWithholding, totalStateWithholding, totalWithholding,
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
     remainingSH, penaltyEst, balanceDueFed, balanceDueState, overpaymentFed,
@@ -822,111 +846,160 @@ const wagesPteResult = computeTax(
 assert("Wages on PTE entity: PTET triggers (entity-driven)", wagesPteResult.totalPTET, 18600);
 
 // ─── TEST 16: CASH FLOW IDENTITY ────────────────────────────────────────────
-section("16. Cash Flow Sanity Check");
+section("16. Cash Flow — Annual Net Cash (Cash-Basis)");
 
-// Simple case: all cash flows should balance
-const cfResult = computeTax(
-  { filingStatus: "mfj", state: "FL", stateRate: 0,
-    livingExpenses: 10000 },
+// Simple case: wages, no entities, no actualDist
+const cfSimple = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 10000 },
   [{ type: "wages", amount: 300000, entity: "Self" }],
-  [], [], []
+  [], [], [], []
 );
-// Net cash = AGI - totalTax - living*12 - debt*12
-// No withholding, no est payments, no PTET/retirement/health, no inv flows
-const expectedCF = cfResult.agi - cfResult.totalTax - 120000;
-assert("Cash flow identity (simple)", cfResult.netCashAfterTax, expectedCF, 2);
+// streamCashIn = 300K (no withholding), no distCashIn, no assetCashIn
+// netCash = 300K - balanceDueFed - balanceDueState - 120K living
+const expectedSimple = 300000 - cfSimple.balanceDueFed - cfSimple.balanceDueState - 120000;
+assert("CF simple: net cash", cfSimple.netCashAfterTax, expectedSimple, 2);
+assert("CF simple: streamCashIn = 300K", cfSimple.streamCashIn, 300000);
+assert("CF simple: distCashIn = 0", cfSimple.distCashIn, 0);
 
-// ─── TEST 17: MONTHLY CF ENGINE — ENTITY DEDUCTIONS ────────────────────────
-section("17. Monthly CF Engine — Entity Deductions");
+// With actualDistributions: streams skipped, distCashIn used instead
+const cfDist = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 10000 },
+  [
+    { type: "business", amount: 2000000, entity: "Partner", timing: "quarterly" },
+    { type: "ltcg", amount: 500000, entity: "Partner", timing: "annual", timingMonth: 2 },
+  ],
+  [], [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 100000, healthInsurance: 30000,
+     actualDistributions: 1200000 }],
+  []
+);
+assert("CF dist: streamCashIn = 0 (all on actualDist entity)", cfDist.streamCashIn, 0);
+assert("CF dist: distCashIn = 1.2M", cfDist.distCashIn, 1200000);
+assert("CF dist: entityDeducNonDist = 0 (entity has actualDist)", cfDist.entityDeducNonDist, 0);
+// netCash = 0 + 1.2M + 0 + 0 - 0 - 0 - est - balDueFed - balDueState - 120K
+const expectedDist = 1200000 - cfDist.totalEstPaid - cfDist.balanceDueFed - cfDist.balanceDueState - 120000;
+assert("CF dist: net cash from actual distributions", cfDist.netCashAfterTax, expectedDist, 2);
 
-function computeMonthlyCashflow(profile, streams, assets, result, liabilities) {
+// Mixed: one entity with actualDist, one without
+const cfMixed = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0, livingExpenses: 10000 },
+  [
+    { type: "business", amount: 1000000, entity: "Firm", timing: "quarterly" },
+    { type: "wages", amount: 200000, entity: "Employer" },
+  ],
+  [], [],
+  [
+    { label: "Firm", pteElection: false, retirementContrib: 50000, healthInsurance: 0, actualDistributions: 700000 },
+    { label: "Employer", pteElection: false, retirementContrib: 0, healthInsurance: 0 },
+  ],
+  []
+);
+assert("CF mixed: streamCashIn = 200K (wages only)", cfMixed.streamCashIn, 200000);
+assert("CF mixed: distCashIn = 700K", cfMixed.distCashIn, 700000);
+assert("CF mixed: entityDeducNonDist = 0 (Employer has no deductions)", cfMixed.entityDeducNonDist, 0);
+
+// ─── TEST 17: MONTHLY CF ENGINE — CASH BASIS ───────────────────────────────
+section("17. Monthly CF Engine — Cash Basis");
+
+function computeMonthlyCashflow(profile, streams, assets, result, liabilities, entities) {
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const qMap = {3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
   const livingExp = profile.livingExpenses || 0;
-  const entityDeducMonthly = ((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)) / 12;
-  const reCFMonthly = (result.reCashFlow||0) / 12;
-
-  let cumulative = 0;
+  const entMap = {}; (entities||[]).forEach(e => { entMap[e.label] = e; });
+  const dSched = {}; (entities||[]).forEach(e => {
+    if ((e.actualDistributions||0) > 0) {
+      const dm = e.distributionMonths || [2,5,8,11];
+      const pm = e.actualDistributions / dm.length;
+      dm.forEach(m => { dSched[m] = (dSched[m]||0) + pm; });
+    }
+  });
+  const edM = (result.entityDeducNonDist||0) / 12;
+  const acM = (result.assetCashIn||0) / 12;
+  let cum = 0;
   return months.map((m, i) => {
-    let grossIn=0, withholding=0;
+    let si=0, wh=0;
     streams.forEach(s => {
       if (!isActiveInMonth_eng(s, i)) return;
-      const timing = s.timing || "monthly";
-      let amt = 0;
-      if (timing === "monthly") amt = (s.amount||0) / 12;
-      else if (timing === "quarterly" && [2,5,8,11].includes(i)) amt = (s.amount||0) / 4;
-      else if (timing === "annual" && i === (s.timingMonth ?? 11)) amt = s.amount||0;
-      else if (timing === "semi" && [5,11].includes(i)) amt = (s.amount||0) / 2;
-      grossIn += amt;
-      withholding += amt * ((s.fedWithholdingPct||0) + (s.stateWithholdingPct||0)) / 100;
+      const ent = entMap[s.entity];
+      if ((ent?.actualDistributions||0) > 0) return;
+      const t = s.timing || "monthly";
+      let a = 0;
+      if (t==="monthly") a = (s.amount||0)/12;
+      else if (t==="quarterly" && [2,5,8,11].includes(i)) a = (s.amount||0)/4;
+      else if (t==="annual" && i === (s.timingMonth??11)) a = s.amount||0;
+      else if (t==="semi" && [5,11].includes(i)) a = (s.amount||0)/2;
+      si += a; wh += a * ((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0))/100;
     });
-    if ([5,11].includes(i)) grossIn += result.invDistributions / 2;
-    grossIn += reCFMonthly;
-    const cashIn = grossIn - withholding;
-    let estPmt = 0;
-    if (qMap[i] !== undefined) estPmt = profile[qMap[i]] || 0;
-    let capCall = 0;
-    if ([2,5,8,11].includes(i)) capCall = result.invCapCalls / 4;
-    let liabPmt = 0;
-    (liabilities||[]).forEach(l => { if (isActiveInMonth_eng(l, i)) liabPmt += (l.monthlyPayment||0); });
-    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entityDeducMonthly;
-    cumulative += net;
-    return { month:m, grossIn, withholding, cashIn, estPmt, livingExp, liabPmt,
-      capCall, entityDeduc:entityDeducMonthly, net, cumulative };
+    const ed = dSched[i] || 0;
+    let fd = 0; if ([5,11].includes(i)) fd = result.invDistributions/2;
+    const ci = si - wh + ed + fd + acM;
+    let ep = 0; if (qMap[i] !== undefined) ep = profile[qMap[i]] || 0;
+    let cc = 0; if ([2,5,8,11].includes(i)) cc = result.invCapCalls/4;
+    let lp = 0; (liabilities||[]).forEach(l => { if (isActiveInMonth_eng(l, i)) lp += (l.monthlyPayment||0); });
+    const net = ci - livingExp - lp - ep - cc - edM;
+    cum += net;
+    return { month:m, cashIn:ci, streamIn:si-wh, entDist:ed, fundDist:fd, assetCash:acM,
+      entDeduc:edM, estPmt:ep, livingExp, liabPmt:lp, capCall:cc, net, cumulative:cum };
   });
 }
 
-// Test with entity deductions
-const cfEntResult = computeTax(
-  { filingStatus: "mfj", state: "CA", stateRate: 14.3,
-    q1Paid: 100000, livingExpenses: 20000 },
+// Case A: No actualDistributions — streams flow through
+const cfEntA = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3, q1Paid: 100000, livingExpenses: 20000 },
   [
     { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
     { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
   ],
   [], [],
-  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000 }]
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000 }],
+  []
 );
-
-const cfMonthly = computeMonthlyCashflow(
+const monthlyA = computeMonthlyCashflow(
   { q1Paid: 100000, livingExpenses: 20000 },
   [
     { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
     { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
   ],
-  [],
-  cfEntResult,
-  []
+  [], cfEntA, [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000 }]
 );
 
-// K-1 total: 1.8M, PTET: 1.8M * 9.3% = 167,400
-// Entity deductions are now a single combined monthly figure
-// Individual components (pte, retire, health) combined into entityDeduc
-assert("CF: Entity deduc = (PTET+retire+health)/12", cfMonthly[0].entityDeduc, (167400+120000+36000)/12, 1);
-assert("CF: Entity deduc total monthly", cfMonthly[0].entityDeduc, (167400 + 120000 + 36000) / 12, 1);
+// Entity deductions: PTET (1.8M*9.3%=167,400) + retire (120K) + health (36K) = 323,400
+assert("CF-A: entity deduc/mo", monthlyA[0].entDeduc, 323400/12, 1);
+assert("CF-A: Jan streamIn = 50K (draw only)", monthlyA[0].streamIn, 50000, 1);
+assert("CF-A: Jan entDist = 0 (no actualDist)", monthlyA[0].entDist, 0);
+assert("CF-A: Mar streamIn = 350K (draw + quarterly)", monthlyA[2].streamIn, 350000, 1);
+assert("CF-A: Apr has Q1 est tax", monthlyA[3].estPmt, 100000);
 
-// Verify entity deductions reduce net flow
-// Jan: gross = 600K/12 = 50K (monthly only, no quarterly in Jan)
-// No withholding (0%), entity deduc ~ 26,950/mo, living 20K, debt 10K, no est, no cap
-// Net = 50K - 0 - 26950 - 20K - 10K - 0 - 0 = ~-6,950
-const janNet = 50000 - 0 - (167400 + 120000 + 36000)/12 - 20000;
-assert("CF: Jan net includes entity deductions", cfMonthly[0].net, janNet, 2);
+// Case B: With actualDistributions — streams skipped, distributions on schedule
+const cfEntB = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3, q1Paid: 100000, livingExpenses: 20000 },
+  [
+    { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
+    { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
+  ],
+  [], [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000,
+     actualDistributions: 1000000, distributionMonths: [2,5,8,11] }],
+  []
+);
+const monthlyB = computeMonthlyCashflow(
+  { q1Paid: 100000, livingExpenses: 20000 },
+  [
+    { type: "business", amount: 600000, entity: "Partner", timing: "monthly" },
+    { type: "business", amount: 1200000, entity: "Partner", timing: "quarterly" },
+  ],
+  [], cfEntB, [],
+  [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000,
+     actualDistributions: 1000000, distributionMonths: [2,5,8,11] }]
+);
 
-// Mar (index 2): quarterly distrib hits + est tax Q1 in Apr (index 3)
-// Gross = 50K + 300K = 350K
-const marGross = 600000/12 + 1200000/4;
-assert("CF: Mar gross = draw + quarterly", cfMonthly[2].grossIn, marGross, 1);
-
-// Apr (index 3): Q1 est tax payment
-assert("CF: Apr has Q1 est tax", cfMonthly[3].estPmt, 100000);
-
-// 12-month cumulative should include all entity deductions
-const annualEntityDeduc = (167400 + 120000 + 36000);
-const totalEntityInCF = cfMonthly.reduce((t, m) => t + m.entityDeduc, 0);
-assert("CF: annual entity deductions sum", totalEntityInCF, annualEntityDeduc, 2);
-
-// Verify entity deductions are non-zero (regression: old engine had 0)
-assert("CF: entity deductions are non-zero", totalEntityInCF > 0, true, 0);
+assert("CF-B: Jan streamIn = 0 (all streams on actualDist entity)", monthlyB[0].streamIn, 0);
+assert("CF-B: Jan entDist = 0 (not a distribution month)", monthlyB[0].entDist, 0);
+assert("CF-B: Mar entDist = 250K (1M/4)", monthlyB[2].entDist, 250000);
+assert("CF-B: Jun entDist = 250K", monthlyB[5].entDist, 250000);
+assert("CF-B: entity deduc = 0 (entity has actualDist)", monthlyB[0].entDeduc, 0);
+assert("CF-B: total annual dist = 1M", monthlyB.reduce((t,m)=>t+m.entDist,0), 1000000);
 
 
 // ═══════════════════════════════════════════════════════════════════════════
