@@ -339,14 +339,43 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const balanceDueState = Math.max(0, stateGross - totalPTET - totalStateWithholding);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
 
-  // Net cash
+  // Net cash — pure cash-basis accounting
+  // Step A: Cash from streams
+  let streamCashIn = 0;
+  streams.forEach(s => {
+    const pf = proFactor(s);
+    const ent = entMap[s.entity];
+    if (ent?.actualDistributions > 0) return; // covered by actualDist
+    const a = (s.amount||0) * pf;
+    streamCashIn += a - a * ((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0)) / 100;
+  });
+  // Step B: Cash from entities with actualDistributions
+  let distCashIn = 0;
+  (entities||[]).forEach(e => { if ((e.actualDistributions||0) > 0) distCashIn += e.actualDistributions; });
+  // Step C: Cash from assets (only actual cash, not phantom K-1 income)
+  let assetCashIn = 0;
+  assets.forEach(item => {
+    const pf = proFactor(item);
+    const at = item.assetType;
+    if (at==="cash") assetCashIn += (item.value||0)*(item.yieldPct||0)/100*pf;
+    else if (at==="security") assetCashIn += (item.value||0)*(item.divYieldPct||0)/100*pf; // divs are cash; realized gains only if sold
+    else if (at==="realEstate") assetCashIn += (item.netCashFlow||0)*pf;
+    // HF/PE: only distributions are cash (invDistributions already computed)
+  });
+  // Step D: Entity deductions for entities WITHOUT actualDist
+  let entityDeducNonDist = 0;
+  Object.entries(k1ByEntity).forEach(([entityLabel]) => {
+    const ent = entMap[entityLabel];
+    if (!ent || (ent.actualDistributions||0) > 0) return; // skip actualDist entities
+    entityDeducNonDist += (ent.pteElection ? Math.abs(k1ByEntity[entityLabel]||0)*(ent.pteRate||0)/100 : 0)
+      + (ent.retirementContrib||0) + (ent.healthInsurance||0);
+  });
+
+  const netCashAfterTax = streamCashIn + distCashIn + assetCashIn + invDistributions - invCapCalls
+    - entityDeducNonDist - totalEstPaid - balanceDueFed - balanceDueState
+    - (profile.livingExpenses||0)*12 - totalLiabPayments;
+
   const totalWithholding = totalFedWithholding + totalStateWithholding;
-  const grossIncome = agi + taxExempt;
-  const netAfterWithholding = grossIncome - totalWithholding;
-  const netCashAfterTax = netAfterWithholding - totalEstPaid - balanceDueFed - balanceDueState
-    - totalPTET - totalRetirement - totalHealthIns - firmRetention
-    - (profile.livingExpenses||0)*12 - totalLiabPayments
-    + invDistributions - invCapCalls + reCashFlow;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
   const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
@@ -371,6 +400,8 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     totalActualDist, totalGrossK1ForDistEnts, phantomIncome, firmRetention, entityDeducTotal,
     // Withholding
     totalFedWithholding, totalStateWithholding, totalWithholding,
+    // Cash-basis fields
+    streamCashIn, distCashIn, assetCashIn, entityDeducNonDist,
     // Safe harbor
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
     remainingSH, penaltyEst,
@@ -410,59 +441,74 @@ function computeBalanceSheet(assets, liabilities) {
 }
 
 // ─── MONTHLY CASH FLOW ENGINE ───────────────────────────────────────────────
-function computeMonthlyCashflow(profile, streams, assets, result, liabilities) {
+function computeMonthlyCashflow(profile, streams, assets, result, liabilities, entities) {
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
   const qMap = {3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
   const qDue = {3:"Apr 15",5:"Jun 15",8:"Sep 15",0:"Jan 15"};
   const livingExp = profile.livingExpenses || 0;
 
-  // Entity deductions prorated monthly
-  const entityDeducMonthly = ((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)) / 12;
+  // Build entity lookup
+  const entMap = {};
+  (entities||[]).forEach(e => { entMap[e.label] = e; });
 
-  // Firm retention (Approach C: gap between gross K-1 and actual distributions, beyond entity deductions)
-  const firmRetMonthly = (result.firmRetention||0) / 12;
+  // Entities with actualDistributions: compute monthly distribution schedule
+  const distSchedule = {};
+  (entities||[]).forEach(e => {
+    if ((e.actualDistributions||0) > 0) {
+      const dMonths = e.distributionMonths || [2,5,8,11];
+      const perMonth = e.actualDistributions / dMonths.length;
+      dMonths.forEach(m => { distSchedule[m] = (distSchedule[m]||0) + perMonth; });
+    }
+  });
 
-  // Liability payments per month (with proration)
-  const liabMonthly = (liabilities||[]).reduce((t,l) => t + (isActiveInMonth(l,0) ? (l.monthlyPayment||0) : 0), 0);
+  // Entity deductions for non-actualDist entities, prorated monthly
+  const entDeducMonthly = (result.entityDeducNonDist||0) / 12;
 
-  // RE cash flow per month
-  const reCFMonthly = (result.reCashFlow||0) / 12;
+  // Asset cash income per month (interest, dividends, RE cash flow)
+  const assetCashMonthly = (result.assetCashIn||0) / 12;
 
   let cumulative = 0;
   return months.map((m, i) => {
-    let grossIn=0, withholding=0;
+    // Streams: only include if entity does NOT have actualDistributions
+    let streamIn=0, withholding=0;
     streams.forEach(s => {
       if (!isActiveInMonth(s, i)) return;
+      const ent = entMap[s.entity];
+      if ((ent?.actualDistributions||0) > 0) return; // skip: covered by entity distributions
       const timing = s.timing || "monthly";
       let amt = 0;
       if (timing === "monthly") amt = (s.amount||0) / 12;
       else if (timing === "quarterly" && [2,5,8,11].includes(i)) amt = (s.amount||0) / 4;
       else if (timing === "annual" && i === (s.timingMonth ?? 11)) amt = s.amount||0;
       else if (timing === "semi" && [5,11].includes(i)) amt = (s.amount||0) / 2;
-      grossIn += amt;
+      streamIn += amt;
       withholding += amt * ((s.fedWithholdingPct||0) + (s.stateWithholdingPct||0)) / 100;
     });
 
-    if ([5,11].includes(i)) grossIn += result.invDistributions / 2;
-    grossIn += reCFMonthly;
+    // Entity distributions (actual cash received from firms)
+    const entDist = distSchedule[i] || 0;
 
-    const cashIn = grossIn - withholding;
+    // Fund distributions (semi-annual Jun/Dec)
+    let fundDist = 0;
+    if ([5,11].includes(i)) fundDist = result.invDistributions / 2;
 
+    const cashIn = streamIn - withholding + entDist + fundDist + assetCashMonthly;
+
+    // Outflows
     let estPmt = 0;
     if (qMap[i] !== undefined) estPmt = profile[qMap[i]] || 0;
 
     let capCall = 0;
     if ([2,5,8,11].includes(i)) capCall = result.invCapCalls / 4;
 
-    // Liability payments for this month (check proration per liability)
     let liabPmt = 0;
     (liabilities||[]).forEach(l => { if (isActiveInMonth(l, i)) liabPmt += (l.monthlyPayment||0); });
 
-    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entityDeducMonthly - firmRetMonthly;
+    const net = cashIn - livingExp - liabPmt - estPmt - capCall - entDeducMonthly;
     cumulative += net;
 
-    return { month:m, idx:i, grossIn, withholding, cashIn, estPmt, livingExp, liabPmt,
-      capCall, entityDeduc:entityDeducMonthly, firmRet:firmRetMonthly,
+    return { month:m, idx:i, cashIn, streamIn, withholding, entDist, fundDist, assetCash:assetCashMonthly,
+      estPmt, livingExp, liabPmt, capCall, entDeduc:entDeducMonthly,
       net, cumulative, qDue:qDue[i] };
   });
 }
@@ -1384,22 +1430,23 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result,
 
 // ─── CASH FLOW TAB ──────────────────────────────────────────────────────────
 
-function CashFlowTab({ profile, streams, result, liabilities }) {
-  const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, [], result, liabilities), [profile, streams, result, liabilities]);
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.grossIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.withholding+m.entityDeduc+m.firmRet)));
+function CashFlowTab({ profile, streams, assets, result, liabilities, entities }) {
+  const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, assets, result, liabilities, entities), [profile, streams, assets, result, liabilities, entities]);
+  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.cashIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.entDeduc)));
   const barH = 140;
+  const hasDist = (entities||[]).some(e => (e.actualDistributions||0) > 0);
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-    <SectionHeader sub="Gross income -> entity deductions -> net deposit -> outflows">{"12-Month Cash Flow"}</SectionHeader>
+    <SectionHeader sub="Cash-basis inflows and outflows by month">{"12-Month Cash Flow"}</SectionHeader>
     {/* Annual summary */}
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(6, 1fr)", gap:8 }}>
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(100px, 1fr))", gap:8 }}>
       {[
-        {l:"Gross Income",v:monthly.reduce((t,m)=>t+m.grossIn,0),c:C.text},
-        {l:"Entity Deductions",v:(result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0),c:C.accent},
-        ...(result.firmRetention>0?[{l:"Firm Retention",v:result.firmRetention,c:C.red}]:[]),
-        {l:"Withholding",v:result.totalWithholding,c:C.orange},
+        ...(hasDist ? [{l:"Distributions",v:result.distCashIn,c:C.green}] : []),
+        {l:"Stream Income",v:result.streamCashIn,c:C.text},
+        {l:"Asset Income",v:result.assetCashIn,c:C.cyan},
+        ...(result.entityDeducNonDist>0?[{l:"Entity Ded.",v:result.entityDeducNonDist,c:C.accent}]:[]),
         {l:"Est. Tax Pmts",v:result.totalEstPaid,c:C.red},
-        {l:"Net Deposits",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:C.green},
+        {l:"Living + Liab.",v:(profile.livingExpenses||0)*12+result.totalLiabPayments,c:C.textDim},
         {l:"Year-End Cum.",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?C.green:C.red},
       ].map((x,i) => (
         <Card key={i} style={{ padding:"10px 12px" }}>
@@ -1408,31 +1455,21 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
         </Card>
       ))}
     </div>
-    {/* Entity deduction breakdown */}
-    {(result.totalPTET||0) + (result.totalRetirement||0) + (result.totalHealthIns||0) > 0 && <Card style={{ padding:"12px 16px" }}>
-      <div style={{ fontSize:9, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:6 }}>{"Entity-Level Cash Deductions (prorated monthly)"}</div>
-      <div style={{ display:"flex", gap:16, fontSize:11 }}>
-        {(result.totalPTET||0)>0 && <div style={{ color:C.textDim }}>PTE: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.accent }}>{fmtD(result.totalPTET,true)}</span>{" ("}{fmtD(result.totalPTET/12)}{"/mo)"}</div>}
-        {(result.totalRetirement||0)>0 && <div style={{ color:C.textDim }}>Retirement: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.blue }}>{fmtD(result.totalRetirement,true)}</span>{" ("}{fmtD(result.totalRetirement/12)}{"/mo)"}</div>}
-        {(result.totalHealthIns||0)>0 && <div style={{ color:C.textDim }}>Health: <span style={{ fontFamily:"'IBM Plex Mono',monospace", color:C.teal }}>{fmtD(result.totalHealthIns,true)}</span>{" ("}{fmtD(result.totalHealthIns/12)}{"/mo)"}</div>}
-      </div>
-    </Card>}
     {/* Bar chart */}
     <Card style={{ padding: "20px 24px" }}>
-      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {[{l:"Net Deposit",c:C.green},{l:"Entity Ded.",c:C.accent},{l:"Firm Ret.",c:C.red+"88"},{l:"W/H",c:C.orange},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liab.",c:C.blue},{l:"Cap Calls",c:C.purple}]
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap:"wrap" }}>
+        {[{l:"Cash In",c:C.green},{l:"Ent. Ded.",c:C.accent},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liab.",c:C.blue},{l:"Cap Calls",c:C.purple}]
           .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:C.textMuted }}>
             <div style={{ width:8, height:8, borderRadius:2, background:x.c }} />{x.l}
           </div>)}
       </div>
       <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: barH + 60 }}>
         {monthly.map((m, i) => {
-          const incH = maxVal>0 ? (m.cashIn/maxVal)*barH : 0;
-          const entH = maxVal>0 ? (m.entityDeduc/maxVal)*barH : 0;
-          const frH = maxVal>0 ? (m.firmRet/maxVal)*barH : 0;
-          const whH = maxVal>0 ? (m.withholding/maxVal)*barH : 0;
+          const incH = maxVal>0 ? (Math.max(0,m.cashIn)/maxVal)*barH : 0;
+          const entH = maxVal>0 ? (m.entDeduc/maxVal)*barH : 0;
           const taxH = maxVal>0 ? (m.estPmt/maxVal)*barH : 0;
           const expH = maxVal>0 ? (m.livingExp/maxVal)*barH : 0;
+          const liabH = maxVal>0 ? (m.liabPmt/maxVal)*barH : 0;
           const capH = maxVal>0 ? (m.capCall/maxVal)*barH : 0;
           return <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
             <div style={{ fontSize:9, color:m.net>=0?C.green:C.red, fontFamily:"'IBM Plex Mono',monospace" }}>
@@ -1441,11 +1478,9 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
             <div style={{ width:"100%", display:"flex", flexDirection:"column", gap:1 }}>
               <div style={{ height:incH, background:C.green+"88", borderRadius:"3px 3px 0 0", minHeight:incH>0?2:0 }} />
               <div style={{ height:entH, background:C.accent+"66", minHeight:entH>0?2:0 }} />
-              {frH > 0 && <div style={{ height:frH, background:C.red+"44", minHeight:2 }} />}
-              <div style={{ height:whH, background:C.orange+"66", minHeight:whH>0?2:0 }} />
               <div style={{ height:taxH, background:C.red+"88", minHeight:taxH>0?2:0 }} />
               <div style={{ height:expH, background:C.textDim+"44", minHeight:expH>0?2:0 }} />
-              {(() => { const lH = maxVal>0?(m.liabPmt/maxVal)*barH:0; return <div style={{ height:lH, background:C.blue+"66", minHeight:lH>0?2:0 }} />; })()}
+              <div style={{ height:liabH, background:C.blue+"66", minHeight:liabH>0?2:0 }} />
               <div style={{ height:capH, background:C.purple+"66", borderRadius:"0 0 3px 3px", minHeight:capH>0?2:0 }} />
             </div>
             <div style={{ fontSize:9, color:C.textMuted }}>{m.month}</div>
@@ -1457,11 +1492,11 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
 
     {/* Detail table */}
     <Card style={{ padding: "20px 24px", overflowX: "auto" }}>
-      <SectionHeader sub="Gross -> W/H -> Entity Ded -> Net In -> Outflows">{"Detail Schedule"}</SectionHeader>
+      <SectionHeader sub="Cash In = Streams + Distributions + Asset Income. Outflows = Tax + Living + Liabilities.">{"Detail Schedule"}</SectionHeader>
       <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
         <thead>
           <tr style={{ borderBottom: `1px solid ${C.borderLight}` }}>
-            {["Month","Gross In","W/H","Ent. Ded","Firm Ret","Net In","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
+            {["Month","Cash In","Streams","Ent. Dist","Asset Inc","Ent. Ded","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
               <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:7, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
             )}
           </tr>
@@ -1470,9 +1505,9 @@ function CashFlowTab({ profile, streams, result, liabilities }) {
           {monthly.map((m,i) => (
             <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
               <td style={{ padding:"6px 4px", color:C.text, fontSize:11 }}>{m.month}{m.qDue ? <span style={{ fontSize:8, color:C.red, marginLeft:3 }}>({m.qDue})</span> : ""}</td>
-              {[m.grossIn, m.withholding, m.entityDeduc, m.firmRet, m.cashIn - m.entityDeduc - m.firmRet, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
+              {[m.cashIn, m.streamIn-m.withholding, m.entDist, m.assetCash+m.fundDist, m.entDeduc, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
                 <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10,
-                  color: j===1?C.orange : j===2?C.accent : j===3?C.red : j>=9?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
+                  color: j===0?C.green : j===4?C.accent : j>=9?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
               )}
             </tr>
           ))}
@@ -1582,24 +1617,25 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
   const td = (v,opts={}) => <td style={{ padding:"5px 8px", textAlign:opts.left?"left":"right", ...mono, fontSize:10, color:opts.color||"#1A1C20", ...(opts.style||{}) }}>{v}</td>;
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
-  // Compute monthly CF for page 5
+  // Compute monthly CF for page 5 (same logic as computeMonthlyCashflow)
   const monthly = (() => {
     const qMap={3:"q1Paid",5:"q2Paid",8:"q3Paid",0:"q4Paid"};
     const livingExp=profile.livingExpenses||0;
-    const entDM=((result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0))/12;
-    const frM=(result.firmRetention||0)/12;
-    const reCFM=(result.reCashFlow||0)/12;
+    const entMap2={};(entities||[]).forEach(e=>{entMap2[e.label]=e;});
+    const dSched={};(entities||[]).forEach(e=>{if((e.actualDistributions||0)>0){const dm=e.distributionMonths||[2,5,8,11];const pm=e.actualDistributions/dm.length;dm.forEach(m=>{dSched[m]=(dSched[m]||0)+pm;});}});
+    const edM=(result.entityDeducNonDist||0)/12;
+    const acM=(result.assetCashIn||0)/12;
     let cum=0;
     return months.map((m,i) => {
-      let g=0,w=0;
-      streams.forEach(s=>{const sm=s.startMonth??0,em=s.endMonth??11;if(i<sm||i>em)return;const t=s.timing||"monthly";let a=0;if(t==="monthly")a=(s.amount||0)/12;else if(t==="quarterly"&&[2,5,8,11].includes(i))a=(s.amount||0)/4;else if(t==="annual"&&i===(s.timingMonth??11))a=s.amount||0;else if(t==="semi"&&[5,11].includes(i))a=(s.amount||0)/2;g+=a;w+=a*((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0))/100;});
-      if([5,11].includes(i))g+=result.invDistributions/2;
-      g+=reCFM;
-      const ci=g-w;let ep=0;if(qMap[i]!==undefined)ep=profile[qMap[i]]||0;
+      let si=0,wh=0;
+      streams.forEach(s=>{const sm=s.startMonth??0,em=s.endMonth??11;if(i<sm||i>em)return;const ent=entMap2[s.entity];if((ent?.actualDistributions||0)>0)return;const t=s.timing||"monthly";let a=0;if(t==="monthly")a=(s.amount||0)/12;else if(t==="quarterly"&&[2,5,8,11].includes(i))a=(s.amount||0)/4;else if(t==="annual"&&i===(s.timingMonth??11))a=s.amount||0;else if(t==="semi"&&[5,11].includes(i))a=(s.amount||0)/2;si+=a;wh+=a*((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0))/100;});
+      const ed=dSched[i]||0;let fd=0;if([5,11].includes(i))fd=result.invDistributions/2;
+      const ci=si-wh+ed+fd+acM;
+      let ep=0;if(qMap[i]!==undefined)ep=profile[qMap[i]]||0;
       let cc=0;if([2,5,8,11].includes(i))cc=result.invCapCalls/4;
       let lp=0;(liabilities||[]).forEach(l=>{const sm=l.startMonth??0,em=l.endMonth??11;if(i>=sm&&i<=em)lp+=(l.monthlyPayment||0);});
-      const n=ci-livingExp-lp-ep-cc-entDM-frM;cum+=n;
-      return {month:m,grossIn:g,withholding:w,cashIn:ci,estPmt:ep,livingExp,liabPmt:lp,capCall:cc,entDeduc:entDM,firmRet:frM,net:n,cumulative:cum};
+      const n=ci-livingExp-lp-ep-cc-edM;cum+=n;
+      return {month:m,cashIn:ci,streamIn:si-wh,entDist:ed,assetCash:acM+fd,entDeduc:edM,estPmt:ep,livingExp,liabPmt:lp,capCall:cc,net:n,cumulative:cum};
     });
   })();
 
@@ -1770,15 +1806,15 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     <div style={{...pg, pageBreakAfter:"auto"}}>
       <div style={hdr}>12-Month Cash Flow Schedule</div>
       <table style={{ width:"100%", borderCollapse:"collapse" }}>
-        <thead>{thead(["Month","Gross In","W/H","Ent. Ded","Firm Ret","Est. Tax","Living","Liab.","Calls","Net","Cumulative"])}</thead>
+        <thead>{thead(["Month","Cash In","Streams","Ent. Dist","Asset Inc","Ent. Ded","Est. Tax","Living","Liab.","Calls","Net","Cumulative"])}</thead>
         <tbody>{monthly.map((m,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE", background:i%2===0?"#FAFAF8":"transparent" }}>
           <td style={{ padding:"4px 8px", fontSize:10 }}>{m.month}</td>
-          {td(fmtD(m.grossIn))}{td(fmtD(m.withholding),{color:"#A86838"})}{td(fmtD(m.entDeduc))}{td(fmtD(m.firmRet))}{td(fmtD(m.estPmt),{color:"#C04040"})}{td(fmtD(m.livingExp))}{td(fmtD(m.liabPmt))}{td(fmtD(m.capCall))}
+          {td(fmtD(m.cashIn),{color:"#2D8060"})}{td(fmtD(m.streamIn))}{td(fmtD(m.entDist))}{td(fmtD(m.assetCash))}{td(fmtD(m.entDeduc))}{td(fmtD(m.estPmt),{color:"#C04040"})}{td(fmtD(m.livingExp))}{td(fmtD(m.liabPmt))}{td(fmtD(m.capCall))}
           {td(fmtD(m.net),{color:m.net>=0?"#2D8060":"#C04040"})}{td(fmtD(m.cumulative),{color:m.cumulative>=0?"#2D8060":"#C04040"})}
         </tr>)}</tbody>
       </table>
       <div style={{ marginTop:20, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
-        {[{l:"Total Gross Income",v:monthly.reduce((t,m)=>t+m.grossIn,0)},{l:"Total Tax + W/H",v:monthly.reduce((t,m)=>t+m.estPmt+m.withholding,0),c:"#C04040"},{l:"Total Entity Deductions",v:(result.totalPTET||0)+(result.totalRetirement||0)+(result.totalHealthIns||0)},{l:"Year-End Cumulative",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?"#2D8060":"#C04040"}]
+        {[{l:"Total Cash In",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:"#2D8060"},{l:"Total Tax Pmts",v:monthly.reduce((t,m)=>t+m.estPmt,0),c:"#C04040"},{l:"Total Living + Liab",v:monthly.reduce((t,m)=>t+m.livingExp+m.liabPmt,0)},{l:"Year-End Cumulative",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?"#2D8060":"#C04040"}]
           .map((k,i) => <div key={i} style={{ padding:10, border:"1px solid #DCD9D0", borderRadius:4 }}>
             <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.1em", textTransform:"uppercase" }}>{k.l}</div>
             <div style={{ ...mono, fontSize:14, color:k.c||"#1A1C20", marginTop:2 }}>{fmtD(k.v,true)}</div>
@@ -2308,7 +2344,7 @@ export default function YosemitePlatform() {
       {tab === "balsheet" && <BalanceSheetTab assets={assets} bs={bs} onEdit={a => setPanel({type:"asset",data:a})} onAdd={() => setPanel({type:"asset",data:null})} onDelete={delAsset} />}
       {tab === "income" && <IncomeTab streams={streams} assets={assets} onEdit={s => setPanel({ type: "income", data: s })} onAdd={() => setPanel({ type: "income", data: null })} onDelete={delStream} />}
       {tab === "deductions" && <DeductionsTab deductions={deductions} setDeductions={setDeds} profile={profile} updProfile={updProfile} result={result} liabilities={liabilities} setLiabs={setLiabs} />}
-      {tab === "cashflow" && <CashFlowTab profile={profile} streams={streams} result={result} liabilities={liabilities} />}
+      {tab === "cashflow" && <CashFlowTab profile={profile} streams={streams} assets={assets} result={result} liabilities={liabilities} entities={entities} />}
       {tab === "scenarios" && <ScenariosTab profile={profile} streams={streams} assets={assets} deductions={deductions} entities={entities} liabilities={liabilities} result={result} />}
       {tab === "entities" && <EntitiesTab entities={entities} setEntities={setEntities} />}
       {tab === "esttax" && <EstTaxTab profile={profile} updProfile={updProfile} result={result} streams={streams} />}
