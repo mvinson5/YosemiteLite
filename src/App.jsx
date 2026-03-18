@@ -2221,23 +2221,23 @@ export default function YosemitePlatform() {
 
     {/* Sidebar - Navy */}
     <div style={{ width: 210, background: C.navBg, borderRight: `1px solid ${C.navBorder}`, display: "flex", flexDirection: "column", flexShrink: 0 }}>
-      <div style={{ padding: "22px 20px 18px", borderBottom: `1px solid ${C.navBorder}` }}>
-        <div style={{ fontFamily: "'Erode',Georgia,serif", fontSize: 20, color: "#FFFFFF", letterSpacing: "0.04em" }}>Yosemite</div>
+      <div style={{ padding: "16px 16px 12px", borderBottom: `1px solid ${C.navBorder}` }}>
+        <div style={{ fontFamily: "'Erode',Georgia,serif", fontSize: 18, color: "#FFFFFF", letterSpacing: "0.04em" }}>Yosemite</div>
         <div style={{ fontSize: 9, letterSpacing: "0.2em", textTransform: "uppercase", color: C.navAccent, marginTop: 2 }}>{"v2 beta-C"}</div>
       </div>
-      <div style={{ padding: "10px 16px", borderBottom: `1px solid ${C.navBorder}` }}>
+      <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.navBorder}` }}>
         <input value={profile.name} onChange={e => updProfile("name", e.target.value)} placeholder="Client / Household Name"
           style={{ width: "100%", background: "none", border: "none", fontSize: 12, color: "#FFFFFF", outline: "none" }} />
         <div style={{ fontSize: 10, color: C.navText, marginTop: 3 }}>{profile.filingStatus.toUpperCase()} {"| "}{STATE_RATES[profile.state]?.label || profile.state}{" | 2025"}</div>
       </div>
-      <nav style={{ flex: 1, padding: "10px 0" }}>
+      <nav style={{ flex: 1, padding: "6px 0", overflow: "auto", minHeight: 0 }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
             style={{
-              display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 20px",
+              display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "8px 16px",
               background: tab === t.id ? C.navActive : "none",
               border: "none", borderLeft: `2px solid ${tab === t.id ? C.navAccent : "transparent"}`,
-              color: tab === t.id ? "#FFFFFF" : C.navText, cursor: "pointer", fontSize: 13,
+              color: tab === t.id ? "#FFFFFF" : C.navText, cursor: "pointer", fontSize: 12,
               fontFamily: "inherit",
             }}>
             <span style={{ fontSize: 12, color: tab === t.id ? C.navAccent : C.navText, width: 14 }}>{t.icon}</span>
@@ -2246,7 +2246,7 @@ export default function YosemitePlatform() {
         ))}
       </nav>
       {/* Sidebar live estimate */}
-      <div style={{ padding: "14px 16px", borderTop: `1px solid ${C.navBorder}` }}>
+      <div style={{ padding: "10px 16px", borderTop: `1px solid ${C.navBorder}`, flexShrink: 0 }}>
         <div style={{ fontSize: 9, color: C.navText, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Live Estimate</div>
         {[
           { l: "Net Worth", v: fmtD(bs.netWorth, true), c: C.gold },
@@ -2256,14 +2256,14 @@ export default function YosemitePlatform() {
           { l: "Eff. Rate", v: pct(result.effectiveRate) },
           { l: "Net Cash", v: fmtD(result.netCashAfterTax, true), c: result.netCashAfterTax >= 0 ? "#5EAA82" : "#E07060" },
         ].map((r, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "3px 0", fontSize: 11 }}>
+          <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0", fontSize: 10 }}>
             <span style={{ color: C.navText }}>{r.l}</span>
             <span style={{ fontFamily: "'IBM Plex Mono',monospace", color: r.c || "#A0B0C0" }}>{r.v}</span>
           </div>
         ))}
       </div>
       {/* Quick Load */}
-      <div style={{ padding: "10px 16px 16px", borderTop: `1px solid ${C.navBorder}` }}>
+      <div style={{ padding: "8px 16px 12px", borderTop: `1px solid ${C.navBorder}`, flexShrink: 0, overflow: "auto", maxHeight: 160 }}>
         <div style={{ fontSize: 9, color: C.navText, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Quick Load</div>
         <button onClick={resetAll}
           style={{ display: "block", width: "100%", textAlign: "left", background: C.navAccent + "20", border: `1px solid ${C.navAccent}40`, borderRadius: 3,
