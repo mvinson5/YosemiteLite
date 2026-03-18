@@ -336,8 +336,9 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
 
   // Balance due
   const balanceDueFed = Math.max(0, federalTax - totalFedWithholding - totalEstPaid);
-  const balanceDueState = Math.max(0, stateGross - totalPTET - totalStateWithholding);
+  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
+  const overpaymentState = Math.max(0, totalStateWithholding - stateTaxAfterPTE);
 
   // Net cash — pure cash-basis accounting
   // Step A: Cash from streams
@@ -405,7 +406,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     // Safe harbor
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
     remainingSH, penaltyEst,
-    balanceDueFed, balanceDueState, overpaymentFed,
+    balanceDueFed, balanceDueState, overpaymentFed, overpaymentState,
     // Cash flow
     invDistributions, invCapCalls, invTaxExempt: taxExempt, reCashFlow,
     schedAInterest, totalLiabPayments,
@@ -1435,85 +1436,160 @@ function DeductionsTab({ deductions, setDeductions, profile, updProfile, result,
 
 function CashFlowTab({ profile, streams, assets, result, liabilities, entities }) {
   const monthly = useMemo(() => computeMonthlyCashflow(profile, streams, assets, result, liabilities, entities), [profile, streams, assets, result, liabilities, entities]);
-  const maxVal = Math.max(1, ...monthly.map(m => Math.max(m.cashIn, m.estPmt+m.livingExp+m.liabPmt+m.capCall+m.entDeduc)));
-  const barH = 140;
-  const hasDist = (entities||[]).some(e => (e.actualDistributions||0) > 0);
+
+  // Compute derived display data
+  const deposits = monthly.map(m => m.cashIn);
+  const taxes = monthly.map(m => m.estPmt);
+  const living = monthly.map(m => m.livingExp);
+  const debt = monthly.map(m => m.liabPmt);
+  const investments = monthly.map(m => m.capCall + m.entDeduc);
+  const nets = monthly.map(m => m.net);
+  const cums = monthly.map(m => m.cumulative);
+  const totDep = deposits.reduce((a,b)=>a+b,0);
+  const totTax = taxes.reduce((a,b)=>a+b,0);
+  const totLiv = living.reduce((a,b)=>a+b,0);
+  const totDebt = debt.reduce((a,b)=>a+b,0);
+  const totInv = investments.reduce((a,b)=>a+b,0);
+  const yearEnd = cums[11]||0;
+  const distMonths = monthly.map(m => m.entDist > 0);
+  const taxMonths = monthly.map(m => m.estPmt > 0);
+
+  // Chart SVG dimensions
+  const W=720, H=240, padL=52, padR=16, padT=20, padB=32;
+  const chartW = W-padL-padR, chartH = H-padT-padB;
+  const allVals = [...nets, ...cums];
+  const yMin = Math.min(0, ...allVals);
+  const yMax = Math.max(0, ...allVals);
+  const yRange = Math.max(1, yMax-yMin) * 1.15;
+  const yLow = yMin - (yRange - (yMax-yMin))*0.3;
+  const yHigh = yLow + yRange;
+  const toY = v => padT + chartH * (1 - (v-yLow)/yRange);
+  const zeroY = toY(0);
+  const barW = chartW / 12 * 0.55;
+  const barGap = chartW / 12;
+
+  // Y-axis ticks
+  const yTicks = [];
+  const step = Math.pow(10, Math.floor(Math.log10(yRange/4)));
+  const niceStep = yRange/4 > step*5 ? step*5 : yRange/4 > step*2 ? step*2 : step;
+  for (let v = Math.ceil(yLow/niceStep)*niceStep; v <= yHigh; v += niceStep) yTicks.push(v);
+
+  const dash = (v) => Math.abs(v) < 0.5 ? "\u2014" : fmtD(v, true);
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
     <SectionHeader sub="Cash-basis inflows and outflows by month">{"12-Month Cash Flow"}</SectionHeader>
-    {/* Annual summary */}
-    <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(100px, 1fr))", gap:8 }}>
+
+    {/* Summary cards */}
+    <div style={{ display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:10 }}>
       {[
-        ...(hasDist ? [{l:"Distributions",v:result.distCashIn,c:C.green}] : []),
-        {l:"Stream Income",v:result.streamCashIn,c:C.text},
-        {l:"Asset Income",v:result.assetCashIn,c:C.cyan},
-        ...(result.entityDeducNonDist>0?[{l:"Entity Ded.",v:result.entityDeducNonDist,c:C.accent}]:[]),
-        {l:"Est. Tax Pmts",v:result.totalEstPaid,c:C.red},
-        {l:"Living + Liab.",v:(profile.livingExpenses||0)*12+result.totalLiabPayments,c:C.textDim},
-        {l:"Year-End Cum.",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?C.green:C.red},
-      ].map((x,i) => (
-        <Card key={i} style={{ padding:"10px 12px" }}>
-          <div style={{ fontSize:7, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:3 }}>{x.l}</div>
-          <div style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:x.c }}>{fmtD(x.v, true)}</div>
+        {l:"Total deposits", v:totDep, c:"#1D9E75"},
+        {l:"Total taxes", v:totTax, c:"#C04040"},
+        {l:"Total expenses", v:totLiv+totDebt+totInv, c:C.text},
+        {l:"Year-end balance", v:yearEnd, c:yearEnd>=0?"#1D9E75":"#C04040"},
+      ].map((k,i) => (
+        <Card key={i} style={{ padding:"14px 16px" }}>
+          <div style={{ fontSize:10, color:C.textMuted, marginBottom:4 }}>{k.l}</div>
+          <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:22, color:k.c, fontWeight:500 }}>{fmtD(k.v, true)}</div>
         </Card>
       ))}
     </div>
-    {/* Bar chart */}
-    <Card style={{ padding: "20px 24px" }}>
-      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap:"wrap" }}>
-        {[{l:"Cash In",c:C.green},{l:"Ent. Ded.",c:C.accent},{l:"Est. Tax",c:C.red},{l:"Living",c:C.textDim},{l:"Liab.",c:C.blue},{l:"Cap Calls",c:C.purple}]
-          .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:4, fontSize:10, color:C.textMuted }}>
-            <div style={{ width:8, height:8, borderRadius:2, background:x.c }} />{x.l}
-          </div>)}
-      </div>
-      <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: barH + 60 }}>
-        {monthly.map((m, i) => {
-          const incH = maxVal>0 ? (Math.max(0,m.cashIn)/maxVal)*barH : 0;
-          const entH = maxVal>0 ? (m.entDeduc/maxVal)*barH : 0;
-          const taxH = maxVal>0 ? (m.estPmt/maxVal)*barH : 0;
-          const expH = maxVal>0 ? (m.livingExp/maxVal)*barH : 0;
-          const liabH = maxVal>0 ? (m.liabPmt/maxVal)*barH : 0;
-          const capH = maxVal>0 ? (m.capCall/maxVal)*barH : 0;
-          return <div key={i} style={{ flex:1, display:"flex", flexDirection:"column", alignItems:"center", gap:2 }}>
-            <div style={{ fontSize:9, color:m.net>=0?C.green:C.red, fontFamily:"'IBM Plex Mono',monospace" }}>
-              {fmtD(m.net, true)}
-            </div>
-            <div style={{ width:"100%", display:"flex", flexDirection:"column", gap:1 }}>
-              <div style={{ height:incH, background:C.green+"88", borderRadius:"3px 3px 0 0", minHeight:incH>0?2:0 }} />
-              <div style={{ height:entH, background:C.accent+"66", minHeight:entH>0?2:0 }} />
-              <div style={{ height:taxH, background:C.red+"88", minHeight:taxH>0?2:0 }} />
-              <div style={{ height:expH, background:C.textDim+"44", minHeight:expH>0?2:0 }} />
-              <div style={{ height:liabH, background:C.blue+"66", minHeight:liabH>0?2:0 }} />
-              <div style={{ height:capH, background:C.purple+"66", borderRadius:"0 0 3px 3px", minHeight:capH>0?2:0 }} />
-            </div>
-            <div style={{ fontSize:9, color:C.textMuted }}>{m.month}</div>
-            <div style={{ fontSize:8, color:C.textDim, fontFamily:"'IBM Plex Mono',monospace" }}>{fmtD(m.cumulative, true)}</div>
-          </div>;
+
+    {/* Chart: net bars + cumulative line */}
+    <Card style={{ padding:"20px 24px" }}>
+      <svg viewBox={`0 0 ${W} ${H}`} style={{ width:"100%", height:"auto" }}>
+        {/* Grid lines */}
+        {yTicks.map((v,i) => <g key={i}>
+          <line x1={padL} x2={W-padR} y1={toY(v)} y2={toY(v)} stroke={C.border} strokeWidth={0.5} />
+          <text x={padL-6} y={toY(v)+3.5} textAnchor="end" fontSize={9} fill={C.textMuted} fontFamily="'IBM Plex Mono',monospace">
+            {v===0 ? "$0" : `${v<0?"-":""}$${Math.abs(Math.round(v/1000))}K`}
+          </text>
+        </g>)}
+        {/* Zero line */}
+        <line x1={padL} x2={W-padR} y1={zeroY} y2={zeroY} stroke={C.textDim} strokeWidth={1} />
+        {/* Bars */}
+        {nets.map((v,i) => {
+          const x = padL + i*barGap + (barGap-barW)/2;
+          const top = v>=0 ? toY(v) : zeroY;
+          const h = Math.max(2, Math.abs(toY(v) - zeroY));
+          return <rect key={i} x={x} y={top} width={barW} height={h} rx={2}
+            fill={v>=0 ? "#1D9E7588" : "#C0404066"} stroke={v>=0 ? "#1D9E75" : "#C04040"} strokeWidth={0.5} />;
         })}
+        {/* Cumulative line */}
+        <polyline fill="none" stroke={C.text} strokeWidth={2} strokeLinejoin="round"
+          points={cums.map((v,i) => `${padL + i*barGap + barGap/2},${toY(v)}`).join(" ")} />
+        {/* Cumulative dots */}
+        {cums.map((v,i) => <circle key={i} cx={padL + i*barGap + barGap/2} cy={toY(v)} r={3.5}
+          fill={v>=0?"#1D9E75":"#C04040"} stroke="white" strokeWidth={1.5} />)}
+        {/* Month labels */}
+        {monthly.map((m,i) => <text key={i} x={padL + i*barGap + barGap/2} y={H-6}
+          textAnchor="middle" fontSize={10} fill={C.textMuted} fontFamily="'Inter',sans-serif">{m.month}</text>)}
+      </svg>
+      <div style={{ display:"flex", gap:16, justifyContent:"center", marginTop:8 }}>
+        {[{l:"Net positive",c:"#1D9E7588",type:"bar"},{l:"Net negative",c:"#C0404066",type:"bar"},{l:"Cumulative balance",c:C.text,type:"line"}]
+          .map((x,i) => <div key={i} style={{ display:"flex", alignItems:"center", gap:5, fontSize:10, color:C.textMuted }}>
+            {x.type==="bar" ? <div style={{ width:12, height:8, borderRadius:2, background:x.c }} />
+              : <div style={{ width:16, height:2.5, borderRadius:1, background:x.c }} />}
+            {x.l}
+          </div>)}
       </div>
     </Card>
 
     {/* Detail table */}
-    <Card style={{ padding: "20px 24px", overflowX: "auto" }}>
-      <SectionHeader sub="Cash In = Streams + Distributions + Asset Income. Outflows = Tax + Living + Liabilities.">{"Detail Schedule"}</SectionHeader>
-      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+    <Card style={{ padding:"20px 24px", overflowX:"auto" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse", fontSize:12 }}>
         <thead>
-          <tr style={{ borderBottom: `1px solid ${C.borderLight}` }}>
-            {["Month","Cash In","Streams","Ent. Dist","Asset Inc","Ent. Ded","Est. Tax","Living","Liab.","Calls","Net","Cum."].map(h =>
-              <th key={h} style={{ textAlign:h==="Month"?"left":"right", padding:"7px 4px", fontSize:7, color:C.textMuted, letterSpacing:"0.1em", textTransform:"uppercase", fontWeight:400 }}>{h}</th>
-            )}
+          <tr style={{ borderBottom:`2px solid ${C.text}` }}>
+            <th style={{ textAlign:"left", padding:"8px 6px", fontSize:10, fontWeight:500, color:C.textMuted, letterSpacing:"0.04em" }}></th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:"#0F6E56", letterSpacing:"0.04em" }}>Deposits</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:"#993C1D", letterSpacing:"0.04em" }}>Taxes</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:C.textMuted, letterSpacing:"0.04em" }}>Living</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:C.textMuted, letterSpacing:"0.04em" }}>Debt</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:"#534AB7", letterSpacing:"0.04em" }}>Investments</th>
+            <th style={{ textAlign:"right", padding:"8px 10px", fontSize:10, fontWeight:500, color:C.text, letterSpacing:"0.04em" }}>Net</th>
+            <th style={{ textAlign:"right", padding:"8px 6px", fontSize:10, fontWeight:500, color:C.textMuted, letterSpacing:"0.04em" }}>Balance</th>
           </tr>
         </thead>
         <tbody>
-          {monthly.map((m,i) => (
-            <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent" }}>
-              <td style={{ padding:"6px 4px", color:C.text, fontSize:11 }}>{m.month}{m.qDue ? <span style={{ fontSize:8, color:C.red, marginLeft:3 }}>({m.qDue})</span> : ""}</td>
-              {[m.cashIn, m.streamIn-m.withholding, m.entDist, m.assetCash+m.fundDist, m.entDeduc, m.estPmt, m.livingExp, m.liabPmt, m.capCall, m.net, m.cumulative].map((v,j) =>
-                <td key={j} style={{ padding:"6px 4px", textAlign:"right", fontFamily:"'IBM Plex Mono',monospace", fontSize:10,
-                  color: j===0?C.green : j===4?C.accent : j>=9?(v>=0?C.green:C.red) : C.textDim }}>{fmtD(v)}</td>
-              )}
-            </tr>
-          ))}
+          {monthly.map((m,i) => {
+            const dep = deposits[i];
+            const inv = investments[i];
+            const isDist = distMonths[i];
+            const isTax = taxMonths[i];
+            return <tr key={i} style={{ borderBottom:`1px solid ${C.border}`, background:i%2===0?C.surface2:"transparent",
+              borderLeft:isDist?`3px solid #1D9E75`:isTax?`3px solid #C04040`:"3px solid transparent" }}>
+              <td style={{ padding:"8px 6px", fontSize:12, fontWeight:500, color:C.text }}>
+                {m.month}
+                {isDist && <span style={{ fontSize:9, color:"#1D9E75", marginLeft:4, fontWeight:400 }}>dist.</span>}
+                {isTax && <span style={{ fontSize:9, color:"#C04040", marginLeft:4, fontWeight:400 }}>{m.qDue || "est."}</span>}
+              </td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                color:"#1D9E75", fontWeight:isDist?500:400 }}>{fmtD(dep, true)}</td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                color:m.estPmt>0?"#C04040":C.textMuted }}>{m.estPmt > 0.5 ? fmtD(m.estPmt, true) : "\u2014"}</td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:C.textDim }}>
+                {fmtD(m.livingExp, true)}</td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11, color:C.textDim }}>
+                {m.liabPmt > 0.5 ? fmtD(m.liabPmt, true) : "\u2014"}</td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                color:inv>0.5?"#534AB7":C.textMuted }}>{inv > 0.5 ? fmtD(inv, true) : "\u2014"}</td>
+              <td style={{ textAlign:"right", padding:"8px 10px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12,
+                fontWeight:500, color:m.net>=0?"#1D9E75":"#C04040" }}>{fmtD(m.net, true)}</td>
+              <td style={{ textAlign:"right", padding:"8px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:11,
+                color:m.cumulative>=0?"#1D9E75":"#C04040" }}>{fmtD(m.cumulative, true)}</td>
+            </tr>;
+          })}
+          {/* Totals row */}
+          <tr style={{ borderTop:`2px solid ${C.text}` }}>
+            <td style={{ padding:"10px 6px", fontSize:12, fontWeight:500 }}>Total</td>
+            <td style={{ textAlign:"right", padding:"10px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:"#0F6E56", fontWeight:500 }}>{fmtD(totDep, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:"#C04040", fontWeight:500 }}>{fmtD(totTax, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12, fontWeight:500 }}>{fmtD(totLiv, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12, fontWeight:500 }}>{fmtD(totDebt, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 6px", fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:"#534AB7", fontWeight:500 }}>{fmtD(totInv, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 10px", fontFamily:"'IBM Plex Mono',monospace", fontSize:13, fontWeight:500,
+              color:yearEnd>=0?"#1D9E75":"#C04040" }}>{fmtD(yearEnd, true)}</td>
+            <td style={{ textAlign:"right", padding:"10px 6px" }}></td>
+          </tr>
         </tbody>
       </table>
     </Card>
@@ -1609,7 +1685,8 @@ function EntitiesTab({ entities, setEntities }) {
 function ReportView({ profile, result, bs, streams, assets, entities, liabilities, onClose }) {
   const navy = "#0F1A2E";
   const mint = "#3DDBB4";
-  const pg = { padding:"48px 56px", pageBreakAfter:"always", position:"relative" };
+  const pg = { padding:"28px 36px", position:"relative" };
+  const pgClass = "report-page";
   const hdr = { fontFamily:"'Erode',Georgia,serif", fontSize:11, color:navy, letterSpacing:"0.2em", textTransform:"uppercase", borderBottom:`2px solid ${navy}`, paddingBottom:6, marginBottom:16 };
   const mono = { fontFamily:"'IBM Plex Mono',monospace" };
   const row = (l,v,opts={}) => <div style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderBottom:`1px solid #E8E5DE`, ...(opts.bold?{fontWeight:600}:{}), ...(opts.style||{}) }}>
@@ -1663,7 +1740,7 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     </div>
 
     {/* PAGE 1: Executive Summary */}
-    <div style={pg}>
+    <div className={pgClass} style={pg}>
       <div style={{ marginBottom:32 }}>
         <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:28, color:navy, marginBottom:4 }}>Yosemite</div>
         <div style={{ fontSize:10, color:"#8A8680", letterSpacing:"0.15em", textTransform:"uppercase" }}>{"Tax Planning Summary | "}{new Date().toLocaleDateString("en-US",{year:"numeric",month:"long",day:"numeric"})}</div>
@@ -1695,7 +1772,7 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     </div>
 
     {/* PAGE 2: Income Summary */}
-    <div style={pg}>
+    <div className={pgClass} style={pg}>
       <div style={hdr}>Income Summary</div>
       <div style={{ fontSize:12, color:navy, fontWeight:500, marginBottom:8 }}>Income Streams</div>
       <table style={{ width:"100%", borderCollapse:"collapse", marginBottom:20 }}>
@@ -1728,7 +1805,7 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     </div>
 
     {/* PAGE 3: Tax Computation */}
-    <div style={pg}>
+    <div className={pgClass} style={pg}>
       <div style={hdr}>Tax Computation Waterfall</div>
       {result.preTaxDeductions > 0 && <><div style={{ fontSize:11, color:navy, fontWeight:500, marginBottom:6 }}>Entity Pre-Tax Deductions</div>
         {row("PTET (entity-level state tax)", fmtD(result.totalPTET,true), {color:mint})}
@@ -1767,7 +1844,7 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     </div>
 
     {/* PAGE 4: Balance Sheet */}
-    <div style={pg}>
+    <div className={pgClass} style={pg}>
       <div style={hdr}>Balance Sheet</div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12, marginBottom:20 }}>
         {[{l:"Total Assets",v:fmtD(bs.totalAssets,true)},{l:"Total Liabilities",v:fmtD(bs.totalLiabilities,true),c:"#C04040"},{l:"Net Worth",v:fmtD(bs.netWorth,true),c:navy}].map((k,i) =>
@@ -1806,24 +1883,44 @@ function ReportView({ profile, result, bs, streams, assets, entities, liabilitie
     </div>
 
     {/* PAGE 5: Cash Flow Schedule */}
-    <div style={{...pg, pageBreakAfter:"auto"}}>
+    <div style={pg}>
       <div style={hdr}>12-Month Cash Flow Schedule</div>
-      <table style={{ width:"100%", borderCollapse:"collapse" }}>
-        <thead>{thead(["Month","Cash In","Streams","Ent. Dist","Asset Inc","Ent. Ded","Est. Tax","Living","Liab.","Calls","Net","Cumulative"])}</thead>
-        <tbody>{monthly.map((m,i) => <tr key={i} style={{ borderBottom:"1px solid #E8E5DE", background:i%2===0?"#FAFAF8":"transparent" }}>
-          <td style={{ padding:"4px 8px", fontSize:10 }}>{m.month}</td>
-          {td(fmtD(m.cashIn),{color:"#2D8060"})}{td(fmtD(m.streamIn))}{td(fmtD(m.entDist))}{td(fmtD(m.assetCash))}{td(fmtD(m.entDeduc))}{td(fmtD(m.estPmt),{color:"#C04040"})}{td(fmtD(m.livingExp))}{td(fmtD(m.liabPmt))}{td(fmtD(m.capCall))}
-          {td(fmtD(m.net),{color:m.net>=0?"#2D8060":"#C04040"})}{td(fmtD(m.cumulative),{color:m.cumulative>=0?"#2D8060":"#C04040"})}
-        </tr>)}</tbody>
-      </table>
-      <div style={{ marginTop:20, display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:10 }}>
-        {[{l:"Total Cash In",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:"#2D8060"},{l:"Total Tax Pmts",v:monthly.reduce((t,m)=>t+m.estPmt,0),c:"#C04040"},{l:"Total Living + Liab",v:monthly.reduce((t,m)=>t+m.livingExp+m.liabPmt,0)},{l:"Year-End Cumulative",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?"#2D8060":"#C04040"}]
-          .map((k,i) => <div key={i} style={{ padding:10, border:"1px solid #DCD9D0", borderRadius:4 }}>
-            <div style={{ fontSize:8, color:"#8A8680", letterSpacing:"0.1em", textTransform:"uppercase" }}>{k.l}</div>
-            <div style={{ ...mono, fontSize:14, color:k.c||"#1A1C20", marginTop:2 }}>{fmtD(k.v,true)}</div>
-          </div>)}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:8, marginBottom:16 }}>
+        {[{l:"Total deposits",v:monthly.reduce((t,m)=>t+m.cashIn,0),c:"#1D9E75"},
+          {l:"Total taxes",v:monthly.reduce((t,m)=>t+m.estPmt,0),c:"#C04040"},
+          {l:"Total expenses",v:monthly.reduce((t,m)=>t+m.livingExp+m.liabPmt+m.capCall+m.entDeduc,0)},
+          {l:"Year-end balance",v:monthly[11]?.cumulative||0,c:(monthly[11]?.cumulative||0)>=0?"#1D9E75":"#C04040"}
+        ].map((k,i) => <div key={i} style={{ padding:8, border:"1px solid #DCD9D0", borderRadius:4 }}>
+          <div style={{ fontSize:7, color:"#8A8680", letterSpacing:"0.08em" }}>{k.l}</div>
+          <div style={{ ...mono, fontSize:14, color:k.c||"#1A1C20", marginTop:2 }}>{fmtD(k.v,true)}</div>
+        </div>)}
       </div>
-      <div style={{ marginTop:24, fontSize:9, color:"#B0ACA4", textAlign:"center" }}>
+      <table style={{ width:"100%", borderCollapse:"collapse" }}>
+        <thead><tr style={{ borderBottom:`2px solid ${navy}` }}>
+          {["","Deposits","Taxes","Living","Debt","Invest.","Net","Balance"].map((c,i) =>
+            <th key={i} style={{ textAlign:i===0?"left":"right", padding:"5px 5px", fontSize:8, color:i===1?"#0F6E56":i===2?"#993C1D":i===5?"#534AB7":navy, letterSpacing:"0.06em", fontWeight:500 }}>{c}</th>
+          )}
+        </tr></thead>
+        <tbody>
+          {monthly.map((m,i) => {
+            const inv = m.capCall + m.entDeduc;
+            const isDist = m.entDist > 0;
+            const isTax = m.estPmt > 0;
+            return <tr key={i} style={{ borderBottom:"1px solid #E8E5DE", background:i%2===0?"#FAFAF8":"transparent",
+              borderLeft:isDist?"3px solid #1D9E75":isTax?"3px solid #C04040":"3px solid transparent" }}>
+              <td style={{ padding:"4px 5px", fontSize:9 }}>{m.month}{isDist?" \u25CF":""}</td>
+              {td(fmtD(m.cashIn,true),{color:"#1D9E75"})}{td(isTax?fmtD(m.estPmt,true):"\u2014",{color:isTax?"#C04040":"#B0ACA4"})}{td(fmtD(m.livingExp,true))}{td(m.liabPmt>0?fmtD(m.liabPmt,true):"\u2014",{color:m.liabPmt>0?"#1A1C20":"#B0ACA4"})}{td(inv>0?fmtD(inv,true):"\u2014",{color:inv>0?"#534AB7":"#B0ACA4"})}
+              {td(fmtD(m.net,true),{color:m.net>=0?"#1D9E75":"#C04040",style:{fontWeight:500}})}{td(fmtD(m.cumulative,true),{color:m.cumulative>=0?"#1D9E75":"#C04040"})}
+            </tr>;
+          })}
+          <tr style={{ borderTop:`2px solid ${navy}` }}>
+            <td style={{ padding:"6px 5px", fontSize:9, fontWeight:500 }}>Total</td>
+            {td(fmtD(monthly.reduce((t,m)=>t+m.cashIn,0),true),{color:"#0F6E56",style:{fontWeight:500}})}{td(fmtD(monthly.reduce((t,m)=>t+m.estPmt,0),true),{color:"#C04040",style:{fontWeight:500}})}{td(fmtD(monthly.reduce((t,m)=>t+m.livingExp,0),true),{style:{fontWeight:500}})}{td(fmtD(monthly.reduce((t,m)=>t+m.liabPmt,0),true),{style:{fontWeight:500}})}{td(fmtD(monthly.reduce((t,m)=>t+m.capCall+m.entDeduc,0),true),{color:"#534AB7",style:{fontWeight:500}})}
+            {td(fmtD(monthly[11]?.cumulative||0,true),{color:(monthly[11]?.cumulative||0)>=0?"#1D9E75":"#C04040",style:{fontWeight:500,fontSize:10}})}<td></td>
+          </tr>
+        </tbody>
+      </table>
+      <div style={{ marginTop:16, fontSize:8, color:"#B0ACA4", textAlign:"center" }}>
         {"Prepared by Yosemite | For planning purposes only | Not tax advice"}
       </div>
     </div>
@@ -1958,52 +2055,67 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
   const unpaidQs = quarters.filter(q => !(profile[q.field]>0)).length;
   const suggestPerQ = unpaidQs > 0 ? Math.ceil(remaining / unpaidQs) : 0;
   const onTrack = remaining <= 0;
-
-  // Streams with withholding
   const withheldStreams = streams.filter(s => (s.fedWithholdingPct||0)>0 || (s.stateWithholdingPct||0)>0);
 
-  return <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
-    <SectionHeader sub="Full tax payment waterfall: liability -> withholding -> estimates -> balance due">{"Tax Payment Optimizer"}</SectionHeader>
+  const fedOwes = result.balanceDueFed > 0;
+  const stOwes = result.balanceDueState > 0;
+  const wfRow = (l,v,c,opts={}) => <div style={{ display:"flex", justifyContent:"space-between", padding:opts.bold?"8px 0":"5px 0",
+    ...(opts.top ? {borderTop:`1px solid ${C.border}`, marginTop:6, paddingTop:8} : {}) }}>
+    <span style={{ fontSize:opts.bold?12:11, color:opts.bold?C.text:C.textDim }}>{l}</span>
+    <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:opts.bold?14:12, color:c }}>{fmtD(v, true)}</span>
+  </div>;
 
-    {/* The Waterfall */}
-    <Card style={{ padding:"20px 24px" }}>
-      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:12 }}>{"Federal Tax Waterfall"}</div>
-      {[
-        {l:"Federal Tax Liability",v:result.federalTax,c:C.red,bold:true},
-        {l:"Less: Federal Withholding",v:-result.totalFedWithholding,c:C.green},
-        {l:"Less: Estimated Tax Payments",v:-result.totalEstPaid,c:C.green},
-        {l:"Total Prepaid",v:result.totalPrepaid,c:C.blue,sub:true},
-        {l:result.balanceDueFed>0?"Balance Due":"Overpayment",v:result.balanceDueFed>0?result.balanceDueFed:-result.overpaymentFed,c:result.balanceDueFed>0?C.red:C.green,bold:true},
-      ].map((row,i) => (
-        <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:row.bold?"8px 0":"4px 0",
-          borderTop:row.sub||row.bold?`1px solid ${C.border}`:"none", marginTop:row.sub||row.bold?6:0 }}>
-          <span style={{ fontSize:row.bold?12:11, color:row.bold?C.text:C.textDim }}>{row.l}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:row.bold?14:12, color:row.c }}>{fmtD(row.v, true)}</span>
+  return <div style={{ display:"flex", flexDirection:"column", gap:16 }}>
+    <SectionHeader sub="Tax liability, payments, and estimated tax optimization">{"Tax Payment Optimizer"}</SectionHeader>
+
+    {/* Outcome cards */}
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+      <Card style={{ padding:"20px 24px", borderColor:fedOwes?C.red+"40":C.green+"40" }}>
+        <div style={{ fontSize:9, letterSpacing:"0.12em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"Federal"}</div>
+        <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:28, color:fedOwes?C.red:C.green, fontWeight:500 }}>
+          {fmtD(fedOwes ? result.balanceDueFed : result.overpaymentFed, true)}
         </div>
-      ))}
-      <div style={{ borderTop:`1px solid ${C.border}`, marginTop:8, paddingTop:8 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
-          <span style={{ fontSize:11, color:C.textDim }}>{"State Tax (gross)"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.red }}>{fmtD(result.stateTax, true)}</span>
+        <div style={{ fontSize:11, color:fedOwes?C.red:C.green, marginTop:2 }}>{fedOwes ? "Balance due" : "Refund"}</div>
+      </Card>
+      <Card style={{ padding:"20px 24px", borderColor:stOwes?C.red+"40":C.green+"40" }}>
+        <div style={{ fontSize:9, letterSpacing:"0.12em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"State (" + (profile.state||"") + ")"}</div>
+        <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:28, color:stOwes?C.red:C.green, fontWeight:500 }}>
+          {fmtD(stOwes ? result.balanceDueState : result.overpaymentState, true)}
         </div>
-        {result.totalPTET > 0 && <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
-          <span style={{ fontSize:11, color:C.textDim }}>{"Less: PTE Credit"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>({fmtD(result.totalPTET, true)})</span>
+        <div style={{ fontSize:11, color:stOwes?C.red:C.green, marginTop:2 }}>{stOwes ? "Balance due" : "Refund"}</div>
+      </Card>
+    </div>
+
+    {/* Waterfalls side by side */}
+    <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 }}>
+      {/* Federal waterfall */}
+      <Card style={{ padding:"18px 22px" }}>
+        <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:10 }}>{"Federal waterfall"}</div>
+        {wfRow("Tax liability", result.federalTax, C.red)}
+        {result.totalFedWithholding > 0 && wfRow("Withholding", -result.totalFedWithholding, C.green)}
+        {result.totalEstPaid > 0 && wfRow("Estimated payments", -result.totalEstPaid, C.green)}
+        {wfRow(fedOwes ? "Balance due" : "Refund", fedOwes ? result.balanceDueFed : result.overpaymentFed, fedOwes ? C.red : C.green, {bold:true, top:true})}
+      </Card>
+      {/* State waterfall */}
+      <Card style={{ padding:"18px 22px" }}>
+        <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.1em", textTransform:"uppercase", marginBottom:10 }}>{"State waterfall (" + (profile.state||"") + ")"}</div>
+        {wfRow("Gross state tax", result.stateTax, C.red)}
+        {result.totalPTET > 0 && wfRow("PTE credit", -result.totalPTET, C.green)}
+        <div style={{ display:"flex", justifyContent:"space-between", padding:"5px 0", borderTop:`1px solid ${C.border}`, marginTop:4, paddingTop:6 }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"Net state liability"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:result.stateTaxAfterPTE>0?C.text:C.green }}>{fmtD(result.stateTaxAfterPTE, true)}</span>
+        </div>
+        {result.totalStateWithholding > 0 && wfRow("State withholding", -result.totalStateWithholding, C.green)}
+        {wfRow(stOwes ? "Balance due" : "Refund", stOwes ? result.balanceDueState : result.overpaymentState, stOwes ? C.red : C.green, {bold:true, top:true})}
+        {result.overpaymentState > 0 && <div style={{ fontSize:10, color:C.green, marginTop:6 }}>
+          {"PTE credit exceeds state liability. Consider reducing state estimated payments."}
         </div>}
-        <div style={{ display:"flex", justifyContent:"space-between", paddingTop:2 }}>
-          <span style={{ fontSize:11, color:C.textDim }}>{"Less: State Withholding"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>({fmtD(result.totalStateWithholding, true)})</span>
-        </div>
-        <div style={{ display:"flex", justifyContent:"space-between", borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
-          <span style={{ fontSize:12, color:C.text }}>{"State Balance Due"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:14, color:result.balanceDueState>0?C.red:C.green }}>{fmtD(result.balanceDueState, true)}</span>
-        </div>
-      </div>
-    </Card>
+      </Card>
+    </div>
 
     {/* Entity-Level Deductions */}
     {(result.totalPTET > 0 || result.totalRetirement > 0 || result.totalHealthIns > 0) && <Card style={{ padding:"16px 20px" }}>
-      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Entity-Level Pre-Tax Deductions"}</div>
+      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Entity-level pre-tax deductions"}</div>
       {result.pteDetails.map((d,i) => (
         <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
           <span style={{ fontSize:11, color:C.textDim }}>{"PTE ("}{d.entity}{" - "}{d.rate}{"% "}{d.state}{")"}</span>
@@ -2011,27 +2123,27 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
         </div>
       ))}
       {result.totalRetirement > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"Retirement Contributions (401k + PS + DB)"}</span>
+        <span style={{ fontSize:11, color:C.textDim }}>{"Retirement (401k + PS + DB)"}</span>
         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.blue }}>{fmtD(result.totalRetirement, true)}</span>
       </div>}
       {result.totalHealthIns > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"Self-Employed Health Insurance"}</span>
+        <span style={{ fontSize:11, color:C.textDim }}>{"Self-employed health insurance"}</span>
         <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.teal }}>{fmtD(result.totalHealthIns, true)}</span>
       </div>}
       <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
         <div style={{ display:"flex", justifyContent:"space-between" }}>
-          <span style={{ fontSize:12, color:C.text }}>{"Total Pre-Tax Deductions"}</span>
+          <span style={{ fontSize:12, color:C.text }}>{"Total pre-tax deductions"}</span>
           <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.accent }}>{fmtD(result.preTaxDeductions + result.totalHealthIns, true)}</span>
         </div>
         {result.pteFedSavings > 0 && <div style={{ fontSize:10, color:C.green, marginTop:4 }}>
-          {"SALT workaround federal savings: ~"}{fmtD(result.pteFedSavings, true)}{" (PTET deducted at entity level, bypasses $10K SALT cap)"}
+          {"SALT workaround saves ~"}{fmtD(result.pteFedSavings, true)}{" in federal tax by bypassing the $10K SALT cap."}
         </div>}
       </div>
     </Card>}
 
     {/* Withholding Sources */}
     {withheldStreams.length > 0 && <Card style={{ padding:"16px 20px" }}>
-      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Withholding Sources"}</div>
+      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Withholding sources"}</div>
       {withheldStreams.map(s => {
         const fedW = (s.amount||0)*(s.fedWithholdingPct||0)/100;
         const stW = (s.amount||0)*(s.stateWithholdingPct||0)/100;
@@ -2051,11 +2163,11 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
     {/* Safe Harbor */}
     <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:12 }}>
       <Card style={{ padding:"16px 18px" }}>
-        <div style={{ fontSize:8, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"110% Prior Year"}</div>
+        <div style={{ fontSize:8, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"110% prior year"}</div>
         <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:22, color:C.text }}>{fmtD(result.safeHarborPY, true)}</div>
       </Card>
       <Card style={{ padding:"16px 18px" }}>
-        <div style={{ fontSize:8, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"90% Current Year"}</div>
+        <div style={{ fontSize:8, letterSpacing:"0.15em", textTransform:"uppercase", color:C.textMuted, marginBottom:6 }}>{"90% current year"}</div>
         <div style={{ fontFamily:"'Erode',Georgia,serif", fontSize:22, color:C.text }}>{fmtD(result.safeHarborCY, true)}</div>
       </Card>
       <Card style={{ padding:"16px 18px", borderColor:onTrack?C.green+"40":C.red+"40" }}>
@@ -2067,7 +2179,7 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
 
     {/* Quarterly Schedule */}
     <Card style={{ padding:"20px 24px" }}>
-      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:12 }}>{"Quarterly Estimated Payments (1040-ES)"}</div>
+      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:12 }}>{"Quarterly estimated payments (1040-ES)"}</div>
       <div style={{ display:"grid", gridTemplateColumns:"repeat(4, 1fr)", gap:12 }}>
         {quarters.map((q,i) => {
           const paid = profile[q.field] || 0;
@@ -2252,7 +2364,9 @@ export default function YosemitePlatform() {
         .no-print { display:none !important; }
         #yosemite-root > *:not(#yosemite-report) { display:none !important; }
         #yosemite-report { position:static !important; overflow:visible !important; height:auto !important; }
-        @page { margin: 0.5in; }
+        .report-page { page-break-after:always; break-after:page; }
+        .report-page:last-child { page-break-after:auto; break-after:auto; }
+        @page { size:letter portrait; margin:0.4in 0.5in; }
       }
     `}</style>
 
