@@ -2203,7 +2203,7 @@ export default function YosemitePlatform() {
   const resetAll = () => { setProfile(PRELOAD_PROFILE); setStreams(PRELOAD_STREAMS); setAssets(PRELOAD_ASSETS); setDeds(PRELOAD_DEDUCTIONS); setEntities(PRELOAD_ENTITIES); setLiabs(PRELOAD_LIABILITIES); };
   const clearAll = () => { setProfile(DEFAULT_PROFILE); setStreams([]); setAssets([]); setDeds([]); setEntities([]); setLiabs([]); };
 
-  return <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'Inter',system-ui,sans-serif", color: C.text, display: "flex" }}>
+  return <div style={{ background: C.bg, height: "100vh", overflow: "hidden", fontFamily: "'Inter',system-ui,sans-serif", color: C.text, display: "flex" }}>
     <style>{`
       @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
       @import url('https://api.fontshare.com/v2/css?f[]=erode@400,500,600&display=swap');
