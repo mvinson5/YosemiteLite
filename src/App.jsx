@@ -2230,6 +2230,22 @@ export default function YosemitePlatform() {
           style={{ width: "100%", background: "none", border: "none", fontSize: 12, color: "#FFFFFF", outline: "none" }} />
         <div style={{ fontSize: 10, color: C.navText, marginTop: 3 }}>{profile.filingStatus.toUpperCase()} {"| "}{STATE_RATES[profile.state]?.label || profile.state}{" | 2025"}</div>
       </div>
+      {/* Live estimate - above nav */}
+      <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.navBorder}` }}>
+        {[
+          { l: "Net Worth", v: fmtD(bs.netWorth, true), c: C.gold },
+          { l: "AGI", v: fmtD(result.agi, true) },
+          { l: "Total Tax", v: fmtD(result.totalTax, true), c: "#E07060" },
+          { l: "Eff. Rate", v: pct(result.effectiveRate) },
+          { l: "Net Cash", v: fmtD(result.netCashAfterTax, true), c: result.netCashAfterTax >= 0 ? "#5EAA82" : "#E07060" },
+        ].map((r, i) => (
+          <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0", fontSize: 10 }}>
+            <span style={{ color: C.navText }}>{r.l}</span>
+            <span style={{ fontFamily: "'IBM Plex Mono',monospace", color: r.c || "#A0B0C0" }}>{r.v}</span>
+          </div>
+        ))}
+      </div>
+      {/* Nav tabs */}
       <nav style={{ flex: 1, padding: "6px 0", overflow: "auto", minHeight: 0 }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)}
@@ -2245,53 +2261,42 @@ export default function YosemitePlatform() {
           </button>
         ))}
       </nav>
-      {/* Sidebar live estimate */}
-      <div style={{ padding: "10px 16px", borderTop: `1px solid ${C.navBorder}`, flexShrink: 0 }}>
-        <div style={{ fontSize: 9, color: C.navText, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Live Estimate</div>
-        {[
-          { l: "Net Worth", v: fmtD(bs.netWorth, true), c: C.gold },
-          { l: "AGI", v: fmtD(result.agi, true) },
-          { l: "Total Tax", v: fmtD(result.totalTax, true), c: "#E07060" },
-          { l: "Withholding", v: fmtD(result.totalWithholding, true), c: "#D4924A" },
-          { l: "Eff. Rate", v: pct(result.effectiveRate) },
-          { l: "Net Cash", v: fmtD(result.netCashAfterTax, true), c: result.netCashAfterTax >= 0 ? "#5EAA82" : "#E07060" },
-        ].map((r, i) => (
-          <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "2px 0", fontSize: 10 }}>
-            <span style={{ color: C.navText }}>{r.l}</span>
-            <span style={{ fontFamily: "'IBM Plex Mono',monospace", color: r.c || "#A0B0C0" }}>{r.v}</span>
-          </div>
-        ))}
-      </div>
-      {/* Quick Load */}
-      <div style={{ padding: "8px 16px 12px", borderTop: `1px solid ${C.navBorder}`, flexShrink: 0, overflow: "auto", maxHeight: 160 }}>
-        <div style={{ fontSize: 9, color: C.navText, letterSpacing: "0.15em", textTransform: "uppercase", marginBottom: 6 }}>Quick Load</div>
-        <button onClick={resetAll}
-          style={{ display: "block", width: "100%", textAlign: "left", background: C.navAccent + "20", border: `1px solid ${C.navAccent}40`, borderRadius: 3,
-            padding: "5px 8px", color: C.navAccent, fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 4 }}>
-          {"Reset to Test Family"}
-        </button>
-        <button onClick={clearAll}
-          style={{ display: "block", width: "100%", textAlign: "left", background: "none", border: `1px solid ${C.navBorder}`, borderRadius: 3,
-            padding: "5px 8px", color: C.navText, fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 6 }}>
-          {"Clear All"}
-        </button>
+      {/* Actions + collapsible presets */}
+      <div style={{ padding: "8px 16px 10px", borderTop: `1px solid ${C.navBorder}`, flexShrink: 0 }}>
         <button onClick={() => setShowReport(true)}
           style={{ display: "block", width: "100%", textAlign: "left", background: C.navActive, border: `1px solid ${C.navBorder}`, borderRadius: 3,
-            padding: "5px 8px", color: "#FFFFFF", fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 6 }}>
+            padding: "5px 8px", color: "#FFFFFF", fontSize: 11, cursor: "pointer", fontFamily: "inherit", marginBottom: 4 }}>
           {"Generate Report"}
         </button>
-        {PERSONA_PRESETS.map((p, i) => (
-          <button key={i} onClick={() => applyPersona(p)}
-            style={{
-              display: "block", width: "100%", textAlign: "left", background: "none", border: "none",
-              padding: "5px 4px", color: C.textDim, fontSize: 11, cursor: "pointer", fontFamily: "inherit",
-              borderRadius: 3,
-            }}
-            onMouseOver={e => e.target.style.color = C.accent}
-            onMouseOut={e => e.target.style.color = C.textDim}>
-            {p.label}
+        <div style={{ display: "flex", gap: 4, marginBottom: 4 }}>
+          <button onClick={resetAll}
+            style={{ flex: 1, textAlign: "center", background: C.navAccent + "18", border: `1px solid ${C.navAccent}30`, borderRadius: 3,
+              padding: "4px 6px", color: C.navAccent, fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>
+            {"Reset"}
           </button>
-        ))}
+          <button onClick={clearAll}
+            style={{ flex: 1, textAlign: "center", background: "none", border: `1px solid ${C.navBorder}`, borderRadius: 3,
+              padding: "4px 6px", color: C.navText, fontSize: 10, cursor: "pointer", fontFamily: "inherit" }}>
+            {"Clear"}
+          </button>
+        </div>
+        <details style={{ fontSize: 10 }}>
+          <summary style={{ color: C.navText, cursor: "pointer", padding: "4px 0", userSelect: "none" }}>{"Presets"}</summary>
+          <div style={{ paddingTop: 4 }}>
+            {PERSONA_PRESETS.map((p, i) => (
+              <button key={i} onClick={() => applyPersona(p)}
+                style={{
+                  display: "block", width: "100%", textAlign: "left", background: "none", border: "none",
+                  padding: "4px 4px", color: C.navText, fontSize: 10, cursor: "pointer", fontFamily: "inherit",
+                  borderRadius: 3,
+                }}
+                onMouseOver={e => e.target.style.color = C.navAccent}
+                onMouseOut={e => e.target.style.color = C.navText}>
+                {p.label}
+              </button>
+            ))}
+          </div>
+        </details>
       </div>
     </div>
 
