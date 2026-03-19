@@ -365,6 +365,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     ? computeStateTax("CA", profile.filingStatus, agi)
     : Math.max(0, agi * ((profile.stateRate||0)/100));
   const stateTaxAfterPTE = Math.max(0, stateGross - totalPTET);
+  const pteExcess = Math.max(0, totalPTET - stateGross); // refundable PTE credit excess
   const stateTax = stateGross; // gross liability before credit
   const totalTax = federalTax + stateTaxAfterPTE;
 
@@ -384,11 +385,11 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const remainingSH = safeHarborPY>0 ? Math.max(0,safeHarborTarget-totalPrepaid) : 0;
   const penaltyEst = remainingSH * 0.08;
 
-  // Balance due
+  // Balance due — state includes PTE excess as refundable credit
   const balanceDueFed = Math.max(0, federalTax - totalFedWithholding - totalEstPaid);
-  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding);
+  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding - pteExcess);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
-  const overpaymentState = Math.max(0, totalStateWithholding - stateTaxAfterPTE);
+  const overpaymentState = Math.max(0, totalStateWithholding + pteExcess - stateTaxAfterPTE);
 
   // Net cash — pure cash-basis accounting
   // Step A: Cash from streams
@@ -445,7 +446,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     totalOrdinary, totalPref, agi,
     qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap, reduction237, itemizedAfter237,
     taxableOrd, taxablePref,
-    ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
+    ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, pteExcess, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
     effectiveFederal: agi>0 ? federalTax/agi*100 : 0,
     marginalOrd, marginalPref, combinedMarginalOrd,
