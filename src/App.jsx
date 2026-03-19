@@ -1724,6 +1724,39 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
     return items;
   }).flat();
 
+  // Per-fund breakdowns for report
+  const isDelphi = (a) => a.label && a.label.toLowerCase().includes("delphi");
+  const isFlex = (a) => a.label && a.label.toLowerCase().includes("flex");
+  const fundBreakdown = (assets||[]).map(a => {
+    const at = a.assetType; const pf = ((a.endMonth??11)-(a.startMonth??0)+1)/12;
+    if (at!=="hedgeFund" && at!=="peFund") return null;
+    const n = a.nav||0;
+    return { label:a.label, delphi:isDelphi(a), flex:isFlex(a),
+      ord: n*((a.ordPct||0)+(a.intPct||0))/100*pf,
+      stcg: n*(a.stcgPct||0)/100*pf,
+      ltcg: n*(a.ltcgPct||0)/100*pf,
+      qdiv: n*(a.qualDivPct||0)/100*pf,
+    };
+  }).filter(Boolean);
+  // Ordinary income sources
+  const delphiOrd = fundBreakdown.filter(x=>x.delphi).reduce((t,x)=>t+x.ord,0);
+  const streamOrd = streams.reduce((t,s) => { const c=INCOME_TYPES[s.type]?.char; return (c==="ordEarned"||c==="ordInv") ? t+(s.amount||0)*((s.endMonth??11)-(s.startMonth??0)+1)/12 : t; },0);
+  const otherAssetOrd = fundBreakdown.filter(x=>!x.delphi).reduce((t,x)=>t+x.ord,0);
+  const cashYield = (assets||[]).filter(a=>a.assetType==="cash").reduce((t,a)=>t+(a.value||0)*(a.yieldPct||0)/100*((a.endMonth??11)-(a.startMonth??0)+1)/12,0);
+  const allOtherOrd = streamOrd + otherAssetOrd + cashYield;
+  const netOrd = delphiOrd + allOtherOrd;
+  // Capital gains sources
+  const flexSTCG = fundBreakdown.filter(x=>x.flex).reduce((t,x)=>t+x.stcg,0);
+  const otherSTCG = fundBreakdown.filter(x=>!x.flex).reduce((t,x)=>t+x.stcg,0);
+  const streamSTCG = streams.reduce((t,s) => INCOME_TYPES[s.type]?.char==="stcg" ? t+(s.amount||0)*((s.endMonth??11)-(s.startMonth??0)+1)/12 : t, 0);
+  const netSTCG = flexSTCG + otherSTCG + streamSTCG;
+  const delphiLTCG = fundBreakdown.filter(x=>x.delphi).reduce((t,x)=>t+x.ltcg,0);
+  const otherFundLTCG = fundBreakdown.filter(x=>!x.delphi).reduce((t,x)=>t+x.ltcg,0);
+  const secLTCG = (assets||[]).filter(a=>a.assetType==="security").reduce((t,a)=>t+(a.value||0)*(a.realizedGainPct||0)/100*((a.endMonth??11)-(a.startMonth??0)+1)/12,0);
+  const streamLTCG = streams.reduce((t,s) => INCOME_TYPES[s.type]?.char==="ltcg" ? t+(s.amount||0)*((s.endMonth??11)-(s.startMonth??0)+1)/12 : t, 0);
+  const allOtherLTCG = otherFundLTCG + secLTCG + streamLTCG;
+  const netLTCG = delphiLTCG + allOtherLTCG;
+
   const fedOwes = result.balanceDueFed > 0;
   const row = (l,v,color) => `<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid #E8E5DE"><span style="font-size:11px;color:#6B6860">${l}</span><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:${color||'#1A1C20'}">${v}</span></div>`;
   const rowB = (l,v,color) => `<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid #0F1A2E;margin-top:6px"><span style="font-size:12px;font-weight:600;color:#1A1C20">${l}</span><span style="font-family:'IBM Plex Mono',monospace;font-size:14px;font-weight:600;color:${color}">${v}</span></div>`;
@@ -1800,6 +1833,32 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
     ${[{l:"Ordinary (Earned)",v:result.ordEarned},{l:"Ordinary (Investment)",v:result.ordInv},{l:"LTCG (after netting)",v:result.netLTAfter},{l:"Qualified Dividends",v:result.qualDiv},
       {l:"STCG (after netting)",v:result.netSTAfter},{l:"Passive",v:result.passiveAllowed},{l:"Tax-Exempt",v:result.taxExempt},{l:"Suspended PAL",v:result.suspendedPAL}
     ].map(k => `<div style="padding:8px;border:1px solid #E8E5DE;border-radius:4px"><div style="font-size:7px;color:#8A8680;letter-spacing:0.08em;text-transform:uppercase">${k.l}</div><div class="mono" style="font-size:12px;color:${k.v<0?'#2D8060':'#1A1C20'};margin-top:2px">${f(k.v,true)}</div></div>`).join("")}
+  </div>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:20px">
+    <div>
+      <div style="font-size:11px;color:#0F1A2E;font-weight:500;margin-bottom:8px">Ordinary Income Sources</div>
+      <div style="border:1px solid #DCD9D0;border-radius:6px;padding:12px 14px">
+        ${row("Delphi Plus", f(delphiOrd,true), delphiOrd<0?"#2D8060":"#1A1C20")}
+        ${row("All other sources", f(allOtherOrd,true))}
+        ${rowB("Net ordinary income", f(netOrd,true), netOrd<0?"#2D8060":"#0F1A2E")}
+        ${delphiOrd<0 ? `<div style="font-size:9px;color:#2D8060;margin-top:6px">Delphi ordinary losses save ~${f(Math.abs(delphiOrd)*(result.marginalOrd/100),true)} at ${p(result.marginalOrd)} marginal rate.</div>` : ""}
+      </div>
+    </div>
+    <div>
+      <div style="font-size:11px;color:#0F1A2E;font-weight:500;margin-bottom:8px">Realized Capital Gains</div>
+      <div style="border:1px solid #DCD9D0;border-radius:6px;padding:12px 14px">
+        <div style="font-size:9px;color:#8A8680;letter-spacing:0.08em;margin-bottom:4px">SHORT-TERM</div>
+        ${row("Flex SMA", f(flexSTCG,true), flexSTCG<0?"#2D8060":"#C04040")}
+        ${otherSTCG!==0||streamSTCG!==0 ? row("All other sources", f(otherSTCG+streamSTCG,true)) : ""}
+        ${rowB("Net STCG", f(netSTCG,true), netSTCG<0?"#2D8060":"#C04040")}
+        <div style="height:8px"></div>
+        <div style="font-size:9px;color:#8A8680;letter-spacing:0.08em;margin-bottom:4px">LONG-TERM</div>
+        ${delphiLTCG!==0 ? row("Delphi Plus", f(delphiLTCG,true), "#1A1C20") : ""}
+        ${row("All other sources", f(allOtherLTCG,true))}
+        ${rowB("Net LTCG", f(netLTCG,true), netLTCG<0?"#2D8060":"#0F1A2E")}
+        ${flexSTCG<0 ? `<div style="font-size:9px;color:#2D8060;margin-top:6px">Flex harvested ${f(Math.abs(flexSTCG),true)} in ST losses, netting against gains at up to ${p(result.marginalOrd)} ordinary rates.</div>` : ""}
+      </div>
+    </div>
   </div>
 </div>
 
