@@ -130,11 +130,16 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
       ltcg += (item.value||0) * (item.realizedGainPct||0) / 100 * pf;
     } else if (at==="hedgeFund" || at==="peFund") {
       const nav = item.nav || 0;
-      ordInv     += nav * (item.ordPct || 0) / 100 * pf;
+      const ordAmt = nav * (item.ordPct || 0) / 100 * pf;
+      const intAmt = nav * (item.intPct || 0) / 100 * pf;
+      if (item.traderElection) {
+        ordEarned += ordAmt + intAmt;
+      } else {
+        ordInv += ordAmt + intAmt;
+      }
       stcg       += nav * (item.stcgPct || 0) / 100 * pf;
       ltcg       += nav * (item.ltcgPct || 0) / 100 * pf;
       qualDiv    += nav * (item.qualDivPct || 0) / 100 * pf;
-      ordInv     += nav * (item.intPct || 0) / 100 * pf;
       taxExempt  += nav * (item.taxExPct || 0) / 100 * pf;
       invDistributions += nav * (item.distPct || 0) / 100 * pf;
       invCapCalls += (item.unfunded||0) * (item.capCallPct || 0) / 100 * pf;
@@ -217,7 +222,20 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
 
   const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,computeSaltCap(agi)) : t+(d.amount||0), 0) + schedAInterest;
   const useItemized = itemizedRaw > p.std;
-  const deductionAmt = (useItemized ? itemizedRaw : p.std) + qbiDeduction;
+  
+  // 2/37 rule (OBBBA, starting 2026)
+  const top37Threshold = p.brackets[p.brackets.length-1][1];
+  let itemizedAfter237 = itemizedRaw;
+  let reduction237 = 0;
+  if (useItemized) {
+    const tentativeTaxableOrd = Math.max(0, totalOrdinary - itemizedRaw - qbiDeduction);
+    const excessOver37 = Math.max(0, tentativeTaxableOrd - top37Threshold);
+    if (excessOver37 > 0) {
+      reduction237 = Math.round((2/37) * Math.min(itemizedRaw, excessOver37));
+      itemizedAfter237 = itemizedRaw - reduction237;
+    }
+  }
+  const deductionAmt = (useItemized ? itemizedAfter237 : p.std) + qbiDeduction;
   const taxableOrd = Math.max(0, totalOrdinary - deductionAmt);
   const taxablePref = Math.max(0, totalPref);
 
@@ -286,18 +304,19 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     - (profile.livingExpenses||0)*12 - totalLiabPayments;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
-  const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
+  const combinedMarginalOrd = marginalOrd + (profile.stateRate||0);
+  const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (combinedMarginalOrd/100) : 0;
   const pteFedSavings = totalPTET * (marginalOrd/100);
 
   return {
     ordEarned, ordInv, stcg, ltcg, qualDiv, passive, passiveAllowed, suspendedPAL, taxExempt,
     netST, netLT, netSTAfter, netLTAfter, capitalLossOffset, capitalLossCarry,
     invOrdinary, totalOrdinary, totalPref, agi,
-    qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap: computeSaltCap(agi),
+    qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap: computeSaltCap(agi), reduction237, itemizedAfter237,
     taxableOrd, taxablePref,
     ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
-    marginalOrd, marginalPref,
+    marginalOrd, marginalPref, combinedMarginalOrd,
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
     totalActualDist, totalGrossK1ForDistEnts, phantomIncome, firmRetention, entityDeducTotal,
     streamCashIn, distCashIn, assetCashIn, entityDeducNonDist,
@@ -1395,6 +1414,140 @@ const mixedResult = computeTax(
 );
 // Only Firm income (1M) triggers PTET, not Employer wages
 assert("Mixed entities: PTET only on PTE entity", mixedResult.totalPTET, 93000);
+
+// ─── TEST 26: 2/37 RULE — ITEMIZED DEDUCTION LIMITATION ─────────────────────
+section("26. 2/37 Rule — Itemized Deduction Limitation (OBBBA 2026)");
+
+// High-income client in 37% bracket with itemized deductions
+// $1.5M wages, $80K itemized deductions (SALT 10K + mortgage 30K + charitable 40K)
+const rule237Result = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+  [{ type: "wages", amount: 1500000, entity: "Self" }],
+  [],
+  [
+    { type: "salt", amount: 50000 },    // capped by phaseout: AGI ~1.5M >> $505K → cap = $10K
+    { type: "mortgage", amount: 30000 },
+    { type: "charitable", amount: 40000 },
+  ],
+  []
+);
+// AGI = $1.5M → SALT cap = max(10000, 40400 - (1500000-505000)*0.30) = max(10000, 40400-298500) = $10,000
+assert("High AGI → SALT cap floors at $10K", rule237Result.saltCap, 10000);
+// Itemized raw = $10K + $30K + $40K = $80K
+assert("Itemized raw = $80K", rule237Result.itemizedRaw, 80000);
+// Tentative taxable ord = 1,500,000 - 80,000 - 0 (QBI) = 1,420,000
+// Excess over 37% threshold ($768,700) = 651,300
+// Reduction = (2/37) × min(80000, 651300) = (2/37) × 80000 = 4324 (rounded)
+assert("2/37 reduction ≈ $4,324", rule237Result.reduction237, 4324);
+assert("Itemized after 2/37 = $75,676", rule237Result.itemizedAfter237, 75676);
+
+// Client NOT in 37% bracket → no 2/37 reduction
+const noRule237 = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
+  [{ type: "wages", amount: 500000, entity: "Self" }],
+  [],
+  [
+    { type: "salt", amount: 50000 },    // $500K AGI → SALT cap = max(10000, 40400 - 0) = $40,400
+    { type: "mortgage", amount: 30000 },
+    { type: "charitable", amount: 40000 },
+  ],
+  []
+);
+// AGI = $500K → below $505K phaseout, full $40,400 SALT cap
+assert("$500K AGI → full SALT cap $40,400", noRule237.saltCap, 40400);
+// Itemized = $40,400 + $30K + $40K = $110,400
+assert("Itemized = $110,400", noRule237.itemizedRaw, 110400);
+// Taxable ord = $500K - $110,400 = $389,600 → below $768,700, not in 37% bracket
+assert("Below 37% → no 2/37 reduction", noRule237.reduction237, 0);
+
+// Edge case: very large itemized deductions exceed the excess-over-37
+// $2M wages, $500K charitable
+const rule237Large = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 2000000, entity: "Self" }],
+  [],
+  [{ type: "charitable", amount: 500000 }],
+  []
+);
+// AGI = $2M, itemized = $500K, tentative taxable = $2M - $500K = $1.5M
+// Excess over $768,700 = $731,300
+// Reduction = (2/37) × min(500000, 731300) = (2/37) × 500000 = 27027 (rounded)
+assert("Large deductions: 2/37 uses min(itemized, excess)", rule237Large.reduction237, 27027);
+
+// ─── TEST 27: §475(f) TRADER ELECTION ────────────────────────────────────────
+section("27. §475(f) Trader Election — Income Character Routing");
+
+// Same fund, with and without trader election
+const baseHF = { assetType: "hedgeFund", nav: 5000000, ordPct: -20, stcgPct: 0, ltcgPct: 10, qualDivPct: 2, intPct: 0, taxExPct: 0, distPct: 0, capCallPct: 0 };
+
+// Without trader election: ordinary loss → ordInv (investment character)
+const noTrader = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 500000, entity: "Self" }],
+  [{ ...baseHF, traderElection: false }],
+  [], []
+);
+
+// With trader election: ordinary loss → ordEarned (business character)
+const withTrader = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 500000, entity: "Self" }],
+  [{ ...baseHF, traderElection: true }],
+  [], []
+);
+
+// Both should have same AGI (same total income flows through)
+assert("Trader election: same AGI", withTrader.agi, noTrader.agi);
+assert("Trader election: same federal tax", withTrader.federalTax, noTrader.federalTax, 1);
+
+// The critical difference: NIIT
+// Without trader: ordInv includes -$1M loss → reduces NII
+// With trader: ordInv = 0, ordEarned absorbs loss → NII is higher → more NIIT
+// Fund: ordPct=-20% of $5M = -$1M ord, ltcgPct=10% = $500K LTCG, qualDivPct=2% = $100K QDiv
+// Without trader: NII = ordInv(-$1M) + LTCG($500K) + QDiv($100K) = max(0, -400K) = 0
+// With trader: NII = ordInv(0) + LTCG($500K) + QDiv($100K) = $600K
+assert("No trader: NII reduced by ord loss", noTrader.nii, 0);
+assert("With trader: NII excludes business loss", withTrader.nii, 600000);
+
+// NIIT difference: AGI = 500K + (-1M ord + 500K LTCG + 100K QDiv) = 100K → below $250K floor → both 0 NIIT
+// Actually AGI = max(0, totalOrdinary + totalPref)
+// Without: totalOrd = 500K(wages) + (-1M inv) = -500K, totalPref = 500K + 100K = 600K, AGI = max(0, -500K + 600K) = 100K
+// With: totalOrd = 500K(wages) + (-1M earned) = -500K, totalPref = 600K, AGI = 100K
+// Both AGI = $100K, below $250K NIIT floor → both $0 NIIT regardless
+assert("Low AGI → NIIT $0 either way", noTrader.niit, 0);
+assert("Low AGI → NIIT $0 either way", withTrader.niit, 0);
+
+// Now test with higher income where NIIT actually differs
+const noTraderHigh = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 2000000, entity: "Self" }],
+  [{ ...baseHF, traderElection: false }],
+  [], []
+);
+const withTraderHigh = computeTax(
+  { filingStatus: "mfj", state: "FL", stateRate: 0 },
+  [{ type: "wages", amount: 2000000, entity: "Self" }],
+  [{ ...baseHF, traderElection: true }],
+  [], []
+);
+// Both: AGI = max(0, (2M + ord) + pref)
+// ordInv without trader = -1M, so totalOrd = 2M - 1M = 1M; totalPref = 600K; AGI = 1.6M
+// ordEarned with trader: totalOrd = 2M - 1M = 1M (same); same AGI = 1.6M
+assert("High income: same AGI both ways", withTraderHigh.agi, noTraderHigh.agi);
+
+// NII differs:
+// Without: NII = max(0, -1M + 500K + 100K) = 0 (ord investment loss wipes pool)  
+// Actually wait — LTCG and QDiv in NII: nii = max(0, ordInv + max(0,netSTAfter) + netLTAfter + qualDiv + passiveAllowed)
+// Without: ordInv = -1M, netLTAfter = 500K, qualDiv = 100K → NII = max(0, -1M + 500K + 100K) = 0  ✗ actually = max(0, -400K) = 0
+// With: ordInv = 0, netLTAfter = 500K, qualDiv = 100K → NII = 600K
+assert("High inc no trader: NII = 0 (loss wipes pool)", noTraderHigh.nii, 0);
+assert("High inc with trader: NII = $600K", withTraderHigh.nii, 600000);
+
+// NIIT: AGI = 1.6M, floor = 250K, niitBase = 1.35M
+// Without: min(0, 1.35M) × 3.8% = $0
+// With: min(600K, 1.35M) × 3.8% = $22,800
+assert("No trader: NIIT = $0", noTraderHigh.niit, 0);
+assert("Trader election: NIIT = $22,800", withTraderHigh.niit, 22800);
 
 // PRINT RESULTS
 // ═══════════════════════════════════════════════════════════════════════════
