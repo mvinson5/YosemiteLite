@@ -250,6 +250,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     ? computeStateTax("CA", profile.filingStatus, agi)
     : Math.max(0, agi * ((profile.stateRate||0)/100));
   const stateTaxAfterPTE = Math.max(0, stateGross - totalPTET);
+  const pteExcess = Math.max(0, totalPTET - stateGross);
   const stateTax = stateGross;
   const totalTax = federalTax + stateTaxAfterPTE;
 
@@ -268,9 +269,9 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const remainingSH = safeHarborPY>0 ? Math.max(0,safeHarborTarget-totalPrepaid) : 0;
   const penaltyEst = remainingSH * 0.08;
   const balanceDueFed = Math.max(0, federalTax - totalFedWithholding - totalEstPaid);
-  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding);
+  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding - pteExcess);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
-  const overpaymentState = Math.max(0, totalStateWithholding - stateTaxAfterPTE);
+  const overpaymentState = Math.max(0, totalStateWithholding + pteExcess - stateTaxAfterPTE);
 
   const totalWithholding = totalFedWithholding + totalStateWithholding;
 
@@ -314,7 +315,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     invOrdinary, totalOrdinary, totalPref, agi,
     qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap: computeSaltCap(agi), reduction237, itemizedAfter237,
     taxableOrd, taxablePref,
-    ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
+    ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, pteExcess, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
     marginalOrd, marginalPref, combinedMarginalOrd,
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
@@ -1548,6 +1549,31 @@ assert("High inc with trader: NII = $600K", withTraderHigh.nii, 600000);
 // With: min(600K, 1.35M) × 3.8% = $22,800
 assert("No trader: NIIT = $0", noTraderHigh.niit, 0);
 assert("Trader election: NIIT = $22,800", withTraderHigh.niit, 22800);
+
+// ─── TEST 28: PTE EXCESS — REFUNDABLE CREDIT ────────────────────────────────
+section("28. PTE Excess Credit — State Refund When PTE > Gross State Tax");
+
+// Entity with PTE at 9.3% on $2M K-1, but low AGI means low state tax
+// K-1 = $500K, PTE = 9.3% × $500K = $46,500, State tax on $500K AGI ≈ ~$30K
+const pteExcessResult = computeTax(
+  { filingStatus: "mfj", state: "CA", stateRate: 9.3 },
+  [{ type: "business", amount: 500000, entity: "Firm" }],
+  [],
+  [],
+  [{ label: "Firm", pteElection: true, pteRate: 9.3, pteState: "CA", retirementContrib: 0, healthInsurance: 0 }],
+  []
+);
+// PTE = 9.3% × $500K = $46,500
+assert("PTE on $500K = $46,500", pteExcessResult.totalPTET, 46500);
+// AGI = $500K - $46,500 (PTE) = $453,500; CA tax on ~$453K ≈ much less than $46.5K
+// stateTaxAfterPTE = max(0, gross - PTE) = $0
+assert("State tax after PTE = $0", pteExcessResult.stateTaxAfterPTE, 0);
+// PTE excess = PTE - gross state > 0
+assert("PTE excess > 0", pteExcessResult.pteExcess > 0, true, 0);
+// Overpayment should equal the PTE excess (no withholding in this test)
+assert("State refund = PTE excess", pteExcessResult.overpaymentState, pteExcessResult.pteExcess);
+// Balance due state = 0
+assert("No state balance due", pteExcessResult.balanceDueState, 0);
 
 // PRINT RESULTS
 // ═══════════════════════════════════════════════════════════════════════════
