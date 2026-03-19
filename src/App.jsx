@@ -481,7 +481,13 @@ function computeBalanceSheet(assets, liabilities) {
   let totalAssets=0, totalBasis=0, totalEmbeddedGain=0, totalUnfunded=0;
   let fundCount=0, nonFundCount=0;
 
+  // Balance sheet is a year-end (Dec 31) snapshot.
+  // Assets that ended before December are excluded to avoid double-counting
+  // transitional positions (e.g., DHEIX sold in March to fund Flex in April).
   assets.forEach(a => {
+    const endM = a.endMonth ?? 11;
+    if (endM < 11) return; // asset exited before year-end — capital moved elsewhere
+
     const at = a.assetType;
     let val=0, basis=0;
     if (at==="cash") { val=a.value||0; basis=val; tiers[1]+=val; nonFundCount++; }
@@ -493,7 +499,10 @@ function computeBalanceSheet(assets, liabilities) {
     totalAssets+=val; totalBasis+=basis; totalEmbeddedGain+=Math.max(0,val-basis);
   });
 
-  const totalLiabilities = (liabilities||[]).reduce((t,l) => t + (l.balance||0), 0);
+  const totalLiabilities = (liabilities||[]).reduce((t,l) => {
+    const endM = l.endMonth ?? 11;
+    return endM < 11 ? t : t + (l.balance||0);
+  }, 0);
   const netWorth = totalAssets - totalLiabilities;
   const liquidNW = tiers[1] + tiers[2] - totalLiabilities;
   return { tiers, totalAssets, totalBasis, totalEmbeddedGain, totalUnfunded, totalLiabilities, netWorth, liquidNW, fundCount, nonFundCount };
@@ -1988,7 +1997,7 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
       `<div style="padding:14px 16px;border:1px solid #DCD9D0;border-radius:6px"><div class="kpi-label">${k.l}</div><div class="mono" style="font-size:20px;color:${k.c||'#1A1C20'}">${k.v}</div></div>`).join("")}
   </div>
   ${[{t:"Tier 1: Cash",k:"1"},{t:"Tier 2: Securities",k:"2"},{t:"Tier 3: Hedge Funds",k:"3"},{t:"Tier 4: PE/VC + Real Estate",k:"4"},{t:"Retirement",k:"R"}].map(tier => {
-    const ta = assets.filter(a => TIER_MAP[a.assetType]===tier.k);
+    const ta = assets.filter(a => TIER_MAP[a.assetType]===tier.k && (a.endMonth ?? 11) >= 11);
     if(!ta.length) return "";
     return `<div style="margin-bottom:12px"><div style="font-size:10px;color:#0F1A2E;font-weight:500;margin-bottom:4px">${tier.t} (${f(bs.tiers[tier.k],true)})</div>
       <table><thead><tr style="border-bottom:2px solid #0F1A2E"><th style="text-align:left">Asset</th><th style="text-align:left">Entity</th><th>Value</th><th>Basis</th><th>Gain</th></tr></thead><tbody>
@@ -2325,79 +2334,75 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
   </div>;
 }
 
-// ─── PRELOADED FAMILY: THE CALDWELLS ────────────────────────────────────────
-// BigLaw partner, married, two kids, SF real estate, PE + AQR allocations
+// ─── PRELOADED FAMILY ────────────────────────────────────────────────────────
+// BigLaw partner, married, SF real estate, AQR allocations
 const PRELOAD_PROFILE = {
   name: "Test Family", filingStatus: "mfj", state: "CA", stateRate: 14.3,
   priorYearLiability: 1050000, priorYearAgi: 2900000,
-  q1Paid: 275000, q2Paid: 275000, q3Paid: 0, q4Paid: 0,
-  livingExpenses: 28000, reProStatus: false,
+  q1Paid: 195000, q2Paid: 195000, q3Paid: 195000, q4Paid: 195000,
+  livingExpenses: 0, reProStatus: true,
 };
 
 const PRELOAD_STREAMS = [
-  { id:"s1", type:"business", label:"K-1 Ordinary - Quarterly Distribution (incl. draw)", amount:2500000, timing:"quarterly", entity:"Husband", qbi:false,
+  { id:"s1", type:"business", label:"Partnership Distributions ($3.1m band)", amount:2800000, timing:"quarterly", entity:"Husband", qbi:false,
     fedWithholdingPct:0, stateWithholdingPct:0 },
 ];
 
 const PRELOAD_ASSETS = [
   // Cash (Tier 1)
-  {id:"a1",assetType:"cash",label:"Schwab Checking + Money Market",value:920000,yieldPct:4.8,entity:"Husband"},
-  {id:"a2",assetType:"cash",label:"Operating Cash - RE LLC",value:45000,yieldPct:0,entity:"Test RE Holdings LLC"},
-  // Securities (Tier 2)
-  {id:"a3",assetType:"security",label:"Direct Equity Portfolio (Schwab)",value:1800000,costBasis:1200000,divYieldPct:1.4,realizedGainPct:0,entity:"Test Family Trust"},
-  // Hedge Funds (Tier 3)
-  {id:"a4",assetType:"hedgeFund",label:"AQR Tax-Aware Delphi Plus Fund",nav:5400000,costBasis:4900000,adjBasis:4500000,unfunded:0,
-    totalReturnPct:12,mgmtFee:2.0,perfFee:20,ordPct:-30,stcgPct:0,ltcgPct:25,qualDivPct:5,intPct:0,taxExPct:0,
-    distPct:0,capCallPct:0,traderElection:true,entity:"Test Family Trust"},
-  {id:"a5",assetType:"hedgeFund",label:"AQR Flex SMA (F250)",nav:3000000,costBasis:2800000,adjBasis:2800000,unfunded:0,
-    totalReturnPct:10,mgmtFee:0.55,perfFee:0,ordPct:0,stcgPct:-50,ltcgPct:0,qualDivPct:1,intPct:0,taxExPct:0,
-    distPct:0,capCallPct:0,entity:"Husband"},
+  {id:"a1",assetType:"cash",label:"DHEIX",value:900000,yieldPct:6.0,entity:"Husband",startMonth:1,endMonth:2},
+  // Hedge Funds (Tier 3) — Delphi Plus
+  {id:"a2",assetType:"hedgeFund",label:"AQR Delphi Plus - Initial",nav:1500000,costBasis:1500000,adjBasis:1500000,unfunded:0,
+    totalReturnPct:12,mgmtFee:1.75,perfFee:20,ordPct:-30,stcgPct:0,ltcgPct:25,qualDivPct:5,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,traderElection:true,entity:"Husband",startMonth:0,endMonth:11},
+  {id:"a3",assetType:"hedgeFund",label:"AQR Delphi Plus - Incremental",nav:3900000,costBasis:3900000,adjBasis:3900000,unfunded:0,
+    totalReturnPct:12,mgmtFee:1.75,perfFee:20,ordPct:-30,stcgPct:0,ltcgPct:25,qualDivPct:5,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,traderElection:true,entity:"Husband",startMonth:2,endMonth:11},
+  // Flex SMA (Tier 3)
+  {id:"a4",assetType:"hedgeFund",label:"AQR Flex SMA (F145) - Initial",nav:1500000,costBasis:900000,adjBasis:900000,unfunded:0,
+    totalReturnPct:0,mgmtFee:0.275,perfFee:0,ordPct:0,stcgPct:-25,ltcgPct:0,qualDivPct:0,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,entity:"Husband",startMonth:0,endMonth:11},
+  {id:"a5",assetType:"hedgeFund",label:"AQR Flex SMA (F145) - Incremental",nav:900000,costBasis:900000,adjBasis:900000,unfunded:0,
+    totalReturnPct:0,mgmtFee:0.275,perfFee:0,ordPct:0,stcgPct:-32,ltcgPct:0,qualDivPct:0,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,entity:"Husband",startMonth:3,endMonth:11},
   // PE Funds (Tier 4)
-  {id:"a6",assetType:"peFund",label:"Silver Lake Partners VII (Buyout)",nav:2500000,costBasis:2000000,adjBasis:1850000,unfunded:500000,
-    totalReturnPct:18,mgmtFee:2.0,perfFee:20,ordPct:-2,stcgPct:0,ltcgPct:8,qualDivPct:0,intPct:0,taxExPct:0,
-    distPct:12,capCallPct:20,entity:"Test Family Trust"},
-  {id:"a7",assetType:"peFund",label:"TCV XI (Growth Equity)",nav:1500000,costBasis:1200000,adjBasis:1125000,unfunded:375000,
-    totalReturnPct:22,mgmtFee:2.0,perfFee:20,ordPct:-1,stcgPct:0,ltcgPct:5,qualDivPct:0,intPct:0,taxExPct:0,
-    distPct:8,capCallPct:25,entity:"Test Family Trust"},
+  {id:"a6",assetType:"peFund",label:"100 New Pl",nav:300000,costBasis:300000,adjBasis:300000,unfunded:0,
+    totalReturnPct:0,mgmtFee:0,perfFee:0,ordPct:0,stcgPct:0,ltcgPct:0,qualDivPct:0,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,entity:"Husband",startMonth:0,endMonth:11},
+  {id:"a7",assetType:"peFund",label:"Bloom + Co-Invests",nav:350000,costBasis:234000,adjBasis:234000,unfunded:0,
+    totalReturnPct:0,mgmtFee:0,perfFee:0,ordPct:0,stcgPct:0,ltcgPct:0,qualDivPct:0,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,entity:"Husband",startMonth:0,endMonth:11},
+  {id:"a8",assetType:"peFund",label:"WSGR",nav:63000,costBasis:67500,adjBasis:67500,unfunded:0,
+    totalReturnPct:0,mgmtFee:0,perfFee:0,ordPct:0,stcgPct:0,ltcgPct:0,qualDivPct:0,intPct:0,taxExPct:0,
+    distPct:0,capCallPct:0,entity:"Husband",startMonth:0,endMonth:11},
   // Real Estate (Tier 4)
-  {id:"a8",assetType:"realEstate",label:"Pacific Heights Duplex",value:3500000,costBasis:2200000,netCashFlow:72000,taxableIncome:-15000,entity:"Test RE Holdings LLC"},
+  {id:"a9",assetType:"realEstate",label:"SF Rental Properties",value:16800000,costBasis:10000000,netCashFlow:360000,taxableIncome:100000,entity:"Husband",startMonth:0,endMonth:11},
   // Retirement (Tier R)
-  {id:"a9",assetType:"retirement",label:"Husband 401(k) / Profit-Sharing",value:1200000,entity:"Husband"},
-  {id:"a10",assetType:"retirement",label:"Wife IRA (Rollover)",value:380000,entity:"Wife"},
+  {id:"a10",assetType:"retirement",label:"Retirement (Trad, Roth, 401k, Cash Bal)",value:1850000,entity:"Husband"},
 ];
 
 const PRELOAD_DEDUCTIONS = [
-  { id: "d1", type: "salt", amount: 10000, label: "SALT (CA - capped)" },
-  { id: "d3", type: "charitable", amount: 40000, label: "Annual Charitable (DAF + Direct)" },
+  { id: "d1", type: "salt", amount: 10000, label: "SALT (capped $10K)" },
 ];
 
 const PRELOAD_ENTITIES = [
   { id:"e1", label:"Husband", type:"individual", filing:"1040 (MFJ)", color:C.gold, ownedBy:"", ownershipPct:100,
     notes:"Partner, BigLaw Test LLP - San Francisco office",
-    pteElection:true, pteRate:9.3, pteState:"CA",
+    pteElection:true, pteRate:10.4, pteState:"CA",
     retirementContrib:138000, healthInsurance:47000,
-    // Approach C: actual distributions received (draws + advances + true-up)
-    actualDistributions:1500000, distributionMonths:[2,5,8,11],
+    actualDistributions:2450000, distributionMonths:[1,3,5,8,10],
   },
   { id:"e2", label:"Wife", type:"individual", filing:"1040 (MFJ)", color:C.blue, ownedBy:"", ownershipPct:100,
     notes:"Spouse",
     pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
   },
-  { id:"e3", label:"Test Family Trust", type:"revTrust", filing:"Grantor -> 1040", color:C.purple, ownedBy:"", ownershipPct:100,
-    notes:"Joint revocable trust - holds PE + Delphi Plus allocations",
-    pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
-  },
-  { id:"e4", label:"Test RE Holdings LLC", type:"llcDisregard", filing:"Sch E -> 1040", color:C.teal, ownedBy:"e3", ownershipPct:100,
-    notes:"Holds Pacific Heights duplex - disregarded entity",
-    pteElection:false, pteRate:0, retirementContrib:0, healthInsurance:0,
-  },
 ];
 
 const PRELOAD_LIABILITIES = [
-  { id:"l1", label:"Primary Residence Mortgage", balance:1400000, monthlyPayment:8200, annualInterest:72000,
-    deductType:"schedA", assetId:"a8", startMonth:0, endMonth:11 },
-  { id:"l2", label:"Schwab SBLOC", balance:0, monthlyPayment:0, annualInterest:0,
-    deductType:"investment", assetId:"", startMonth:0, endMonth:11 },
+  { id:"l1", label:"Investment Properties", balance:9415000, monthlyPayment:47000, annualInterest:500000,
+    deductType:"schedE", startMonth:0, endMonth:11 },
+  { id:"l2", label:"Capital Loan", balance:900000, monthlyPayment:8900, annualInterest:108000,
+    deductType:"investment", startMonth:0, endMonth:11 },
 ];
 
 // --- PERSONA PRESETS ────────────────────────────────────────────────────────
