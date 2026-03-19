@@ -422,14 +422,18 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
       + (ent.retirementContrib||0) + (ent.healthInsurance||0);
   });
 
-  const netCashAfterTax = streamCashIn + distCashIn + assetCashIn + invDistributions - invCapCalls
+  // netCashAfterTax is now derived from the monthly CF schedule (see CashFlowTab)
+  // to ensure the executive summary always reconciles with the detail table.
+  // The annual approximation is kept as a fallback but the UI should use monthly cumulative.
+  const netCashAfterTaxAnnual = streamCashIn + distCashIn + assetCashIn + invDistributions - invCapCalls
     - entityDeducNonDist - totalEstPaid - balanceDueFed - balanceDueState
     - (profile.livingExpenses||0)*12 - totalLiabPayments;
 
   const totalWithholding = totalFedWithholding + totalStateWithholding;
 
   const invOrdinary = assets.filter(a=>a.assetType==="hedgeFund"||a.assetType==="peFund").reduce((t,a) => t + (a.nav||0)*(a.ordPct||0)/100, 0);
-  const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (marginalOrd/100) : 0;
+  const combinedMarginalOrd = marginalOrd + (profile.stateRate||0);
+  const ordLossBenefit = invOrdinary < 0 ? Math.abs(invOrdinary) * (combinedMarginalOrd/100) : 0;
 
   // Federal tax savings from PTET (the SALT workaround benefit)
   const pteFedSavings = totalPTET * (marginalOrd/100);
@@ -444,7 +448,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
     effectiveFederal: agi>0 ? federalTax/agi*100 : 0,
-    marginalOrd, marginalPref,
+    marginalOrd, marginalPref, combinedMarginalOrd,
     // Entity-level deductions
     totalPTET, pteDetails, pteFedSavings, totalRetirement, totalHealthIns, preTaxDeductions,
     // Approach C: actual distributions
@@ -460,7 +464,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     // Cash flow
     invDistributions, invCapCalls, invTaxExempt: taxExempt, reCashFlow,
     schedAInterest, totalLiabPayments,
-    netCashAfterTax, ordLossBenefit,
+    netCashAfterTax: netCashAfterTaxAnnual, ordLossBenefit,
     // Back-compat
     totalLTCG: totalPref, taxableLTCG: taxablePref, ltcgTax: prefTax, marginalLTCG: marginalPref,
     safeHarborMin: safeHarborTarget, totalPaid: totalEstPaid,
@@ -1014,7 +1018,7 @@ function OverviewTab({ profile, result, streams, assets, updProfile, bs }) {
     const loss = (i.nav||0) * (i.stcgPct||0) / 100;
     return t + (loss < 0 ? Math.abs(loss) : 0);
   }, 0);
-  const delphiBenefit = aqrOrdLoss * (result.marginalOrd/100 + (profile.stateRate||0)/100*0.88);
+  const delphiBenefit = aqrOrdLoss * (result.combinedMarginalOrd/100);
   const flexBenefit = aqrSTCL * ((result.marginalPref+3.8)/100 + (profile.stateRate||0)/100*0.88);
 
   return <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -1061,7 +1065,7 @@ function OverviewTab({ profile, result, streams, assets, updProfile, bs }) {
           <div>
             <div style={{ fontSize: 9, letterSpacing: "0.18em", textTransform: "uppercase", color: C.green, marginBottom: 6 }}>{"Delphi Plus - Ordinary Loss Offset"}</div>
             <div style={{ fontSize: 11, color: C.textDim, lineHeight: 1.6 }}>
-              {fmtD(aqrOrdLoss, true)} ordinary losses from NPC trades offset earned income at {pct(result.marginalOrd)} federal + {profile.stateRate}% state.
+              {fmtD(aqrOrdLoss, true)} ordinary losses offset earned income at {pct(result.combinedMarginalOrd)} combined ({pct(result.marginalOrd)} fed + {pct(profile.stateRate||0)} state).
             </div>
           </div>
           <div style={{ textAlign: "right", flexShrink: 0, marginLeft: 20 }}>
@@ -1914,7 +1918,7 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
         ${row("Delphi Plus", f(delphiOrd,true), delphiOrd<0?"#2D8060":"#1A1C20")}
         ${row("All other sources", f(allOtherOrd,true))}
         ${rowB("Net ordinary income", f(netOrd,true), netOrd<0?"#2D8060":"#0F1A2E")}
-        ${delphiOrd<0 ? `<div style="font-size:9px;color:#2D8060;margin-top:6px">Delphi ordinary losses save ~${f(Math.abs(delphiOrd)*(result.marginalOrd/100),true)} at ${p(result.marginalOrd)} marginal rate.</div>` : ""}
+        ${delphiOrd<0 ? `<div style="font-size:9px;color:#2D8060;margin-top:6px">Delphi ordinary losses save ~${f(Math.abs(delphiOrd)*(result.combinedMarginalOrd/100),true)} at ${p(result.combinedMarginalOrd)} combined marginal rate (${p(result.marginalOrd)} fed + ${p(profile.stateRate||0)} state).</div>` : ""}
       </div>
     </div>
     <div>
@@ -2444,6 +2448,10 @@ export default function YosemitePlatform() {
   const updProfile = (k, v) => setProfile(p => ({ ...p, [k]: v }));
   const result = useMemo(() => computeTax(profile, streams, assets, deductions, entities, liabilities), [profile, streams, assets, deductions, entities, liabilities]);
   const bs = useMemo(() => computeBalanceSheet(assets, liabilities), [assets, liabilities]);
+  // Monthly CF is the single source of truth for net cash — derives from per-asset timing
+  const monthlyCF = useMemo(() => computeMonthlyCashflow(profile, streams, assets, result, liabilities, entities), [profile, streams, assets, result, liabilities, entities]);
+  // Override annual approximation with monthly cumulative so executive summary reconciles
+  if (monthlyCF.length === 12) result.netCashAfterTax = monthlyCF[11].cumulative;
 
   const saveStream = (s) => { setStreams(p => p.find(x => x.id === s.id) ? p.map(x => x.id === s.id ? s : x) : [...p, s]); setPanel(null); };
   const delStream = (id) => { setStreams(p => p.filter(x => x.id !== id)); setPanel(null); };
