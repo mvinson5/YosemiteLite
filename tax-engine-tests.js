@@ -164,7 +164,8 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     if ((ent.healthInsurance||0) > 0) totalHealthIns += ent.healthInsurance;
   });
 
-  const preTaxDeductions = totalPTET + totalRetirement;
+  // PTET: credit-only. K-1 input is already post-PTET.
+  const preTaxDeductions = totalRetirement;
   ordEarned = ordEarned - preTaxDeductions;
 
   // Approach C: actual distributions
@@ -297,8 +298,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   Object.entries(k1ByEntity).forEach(([entityLabel]) => {
     const ent = entMap[entityLabel];
     if (!ent || (ent.actualDistributions||0) > 0) return;
-    entityDeducNonDist += (ent.pteElection ? Math.abs(k1ByEntity[entityLabel]||0)*(ent.pteRate||0)/100 : 0)
-      + (ent.retirementContrib||0) + (ent.healthInsurance||0);
+    entityDeducNonDist += (ent.retirementContrib||0) + (ent.healthInsurance||0);
   });
   const netCashAfterTax = streamCashIn + distCashIn + assetCashIn + invDistributions - invCapCalls
     - entityDeducNonDist - totalEstPaid - balanceDueFed - balanceDueState
@@ -614,9 +614,9 @@ const pteResult = computeTax(
 assert("PTET computed on total K-1 income", pteResult.totalPTET, 279000);
 assert("PTET detail has 1 entry", pteResult.pteDetails.length, 1, 0);
 
-// ordEarned should be reduced by PTET
-// Gross ordEarned: 1.6M + 1M = 2.6M, minus PTET 279K = 2.321M
-assert("ordEarned reduced by PTET", pteResult.ordEarned, 2600000 - 279000);
+// ordEarned should NOT be reduced by PTET — K-1 is entered post-PTET
+// Gross ordEarned: 1.6M + 1M = 2.6M (PTET already reflected in K-1 input)
+assert("ordEarned NOT reduced by PTET", pteResult.ordEarned, 2600000);
 
 // State tax should show credit
 assert("State gross > 0", pteResult.stateTax > 0, true, 0);
@@ -688,10 +688,10 @@ const fullResult = computeTax(
 assert("Full: PTET = $288,300", fullResult.totalPTET, 288300);
 assert("Full: Retirement = $138K", fullResult.totalRetirement, 138000);
 assert("Full: Health = $47K", fullResult.totalHealthIns, 47000);
-assert("Full: preTaxDeductions = PTET + retirement", fullResult.preTaxDeductions, 288300 + 138000);
+assert("Full: preTaxDeductions = retirement only", fullResult.preTaxDeductions, 138000);
 
-// ordEarned: (300K + 2.2M) - (288300 + 138000) = 2,500,000 - 426,300 = 2,073,700
-assert("Full: ordEarned after pre-tax", fullResult.ordEarned, 2073700);
+// ordEarned: (300K + 2.2M) - 138,000 (retirement only) = 2,362,000 (PTET already in K-1)
+assert("Full: ordEarned after pre-tax", fullResult.ordEarned, 2362000);
 
 // ordInv: cash 920K*4.8% = 44,160 + Delphi -30%*5.4M = -1,620,000 + Flex 0 + SL -2%*2.5M = -50,000 + TCV -1%*1.5M = -15,000
 // = 44160 - 1620000 - 50000 - 15000 = -1,640,840
@@ -710,9 +710,9 @@ assert("Full: STCG from Flex", fullResult.stcg, -1500000);
 assert("Full: Schedule D net LTCG after netting", fullResult.netLTAfter, 725000);
 assert("Full: Schedule D ST absorbed", fullResult.netSTAfter, 0);
 
-// Marginal rate: Delphi -30% ord losses are massive ($1.62M), pushing taxableOrd
-// down to ~$336K which is in the 24% bracket (201,050-383,900)
-assert("Full: marginal ordinary = 24% (Delphi losses compress)", fullResult.marginalOrd, 24);
+// Marginal rate: without PTET deduction from income, taxableOrd is higher
+// ~$624K after deductions, landing in 35% bracket (512,450-768,700)
+assert("Full: marginal ordinary = 35% (no PTET income reduction)", fullResult.marginalOrd, 35);
 
 // Safe harbor: 110% * 1.05M = 1.155M
 assert("Full: safe harbor PY = $1,155,000", fullResult.safeHarborPY, 1155000);
@@ -837,16 +837,16 @@ assert("Zero income: AGI = 0", zeroResult.agi, 0);
 assert("Zero income: tax = 0", zeroResult.totalTax, 0);
 assert("Zero income: NIIT = 0", zeroResult.niit, 0);
 
-// Negative ordEarned after massive PTET + retirement
+// Negative ordEarned after massive retirement (PTET no longer deducted)
 const negOrdResult = computeTax(
   { filingStatus: "mfj", state: "FL", stateRate: 0 },
   [{ type: "business", amount: 100000, entity: "Partner" }],
   [], [],
   [{ label: "Partner", pteElection: true, pteRate: 50, retirementContrib: 200000, healthInsurance: 0 }]
 );
-// PTET: 100K * 50% = 50K. Retirement: 200K. Pre-tax = 250K.
-// ordEarned: 100K - 250K = -150K
-assert("Negative ordEarned after pre-tax", negOrdResult.ordEarned, -150000);
+// PTET: 100K * 50% = 50K (credit only, not deducted). Retirement: 200K.
+// ordEarned: 100K - 200K = -100K
+assert("Negative ordEarned after pre-tax", negOrdResult.ordEarned, -100000);
 assert("AGI floors at 0", negOrdResult.agi, 0, 1);
 
 // No entities passed
@@ -1018,8 +1018,8 @@ const monthlyA = computeMonthlyCashflow(
   [{ label: "Partner", pteElection: true, pteRate: 9.3, retirementContrib: 120000, healthInsurance: 36000 }]
 );
 
-// Entity deductions: PTET (1.8M*9.3%=167,400) + retire (120K) + health (36K) = 323,400
-assert("CF-A: entity deduc/mo", monthlyA[0].entDeduc, 323400/12, 1);
+// Entity deductions: retire (120K) + health (36K) = 156,000 (PTET not deducted — already in K-1)
+assert("CF-A: entity deduc/mo", monthlyA[0].entDeduc, 156000/12, 1);
 assert("CF-A: Jan streamIn = 50K (draw only)", monthlyA[0].streamIn, 50000, 1);
 assert("CF-A: Jan entDist = 0 (no actualDist)", monthlyA[0].entDist, 0);
 assert("CF-A: Mar streamIn = 350K (draw + quarterly)", monthlyA[2].streamIn, 350000, 1);
@@ -1288,10 +1288,12 @@ assert("Scenario FL: total = federal only", Math.abs(flR.totalTax - flR.federalT
 const noPteEnts = scBase.entities.map(e => ({...e, pteElection:false}));
 const noPteR = computeTax(scBase.profile, scBase.streams, scBase.assets, scBase.deds, noPteEnts, scBase.liabs);
 assert("Scenario no PTE: PTET = 0", noPteR.totalPTET, 0);
-assert("Scenario no PTE: higher federal tax (no deduction)", noPteR.federalTax > baseR.federalTax, true, 0);
+// With PTET refactored as credit-only, federal tax is identical with or without PTE
+// The benefit is purely in the state credit
+assert("Scenario no PTE: same federal tax (PTET is credit only)", Math.abs(noPteR.federalTax - baseR.federalTax) < 1, true, 0);
 assert("Scenario no PTE: higher state (no credit)", noPteR.stateTaxAfterPTE > baseR.stateTaxAfterPTE, true, 0);
 const pteBenefit = noPteR.totalTax - baseR.totalTax;
-assert("Scenario no PTE: PTET saves >$50K", pteBenefit > 50000, true, 0);
+assert("Scenario no PTE: PTE credit saves on state tax", pteBenefit > 0, true, 0);
 
 // RE Professional
 const reProProfile = { ...scBase.profile, reProStatus:true };
