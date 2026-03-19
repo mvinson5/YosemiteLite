@@ -251,10 +251,12 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     if ((ent.healthInsurance||0) > 0) totalHealthIns += ent.healthInsurance;
   });
 
-  // Apply pre-tax deductions: PTET + retirement reduce earned income
-  // PTET is a partnership-level deduction that reduces K-1 income before the 1040
-  // Retirement contributions reduce K-1 ordinary income
-  const preTaxDeductions = totalPTET + totalRetirement;
+  // Apply pre-tax deductions: retirement reduces K-1 ordinary income above the line (Sched 1 line 16)
+  // NOTE: PTET is NOT deducted here. The K-1 user enters already reflects PTET — the partnership
+  // deducted it at the entity level before issuing the K-1. We only track PTET for:
+  //   (a) state tax credit (dollar-for-dollar offset against state liability)
+  //   (b) federal savings display (informational — shows benefit of SALT bypass)
+  const preTaxDeductions = totalRetirement;
   ordEarned = ordEarned - preTaxDeductions;
 
   // PTET generates a state tax credit (dollar for dollar)
@@ -415,12 +417,13 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     // HF/PE: only distributions are cash (invDistributions already computed)
   });
   // Step D: Entity deductions for entities WITHOUT actualDist
+  // NOTE: PTET is excluded — the K-1 (stream input) already reflects entity-level PTET deduction.
+  // Only retirement + health are separate cash outflows from the partner's perspective.
   let entityDeducNonDist = 0;
   Object.entries(k1ByEntity).forEach(([entityLabel]) => {
     const ent = entMap[entityLabel];
     if (!ent || (ent.actualDistributions||0) > 0) return; // skip actualDist entities
-    entityDeducNonDist += (ent.pteElection ? Math.abs(k1ByEntity[entityLabel]||0)*(ent.pteRate||0)/100 : 0)
-      + (ent.retirementContrib||0) + (ent.healthInsurance||0);
+    entityDeducNonDist += (ent.retirementContrib||0) + (ent.healthInsurance||0);
   });
 
   // netCashAfterTax is now derived from the monthly CF schedule (see CashFlowTab)
@@ -1887,7 +1890,7 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
   </div>` : ""}
   ${result.totalPTET > 0 ? `<div class="callout" style="background:#F0FAF6;border:1px solid #C8E8DC">
     <div style="font-size:9px;color:#2D8060;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:4px">SALT Workaround</div>
-    PTE election generates ${f(result.totalPTET,true)} in entity-level state tax, providing ~${f(result.pteFedSavings,true)} in federal savings.
+    PTE election saves ~${f(result.pteFedSavings,true)} vs. paying state tax personally (already reflected in K-1 income).
   </div>` : ""}
 </div>
 
@@ -1943,12 +1946,12 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
 <!-- PAGE 3: Tax Computation -->
 <div class="page">
   <div class="hdr">Tax Computation Waterfall</div>
-  ${result.preTaxDeductions > 0 ? `<div style="font-size:11px;color:#0F1A2E;font-weight:500;margin-bottom:6px">Entity Pre-Tax Deductions</div>
-    ${row("PTET (entity-level state tax)",f(result.totalPTET,true),"#3DDBB4")}
-    ${result.totalRetirement>0?row("Retirement Contributions",f(result.totalRetirement,true),"#2E5C94"):""}
+  ${(result.totalRetirement > 0 || result.totalHealthIns > 0) ? `<div style="font-size:11px;color:#0F1A2E;font-weight:500;margin-bottom:6px">Above-the-Line Deductions</div>
+    ${result.totalRetirement>0?row("Retirement Contributions (401k + PS + DB)",f(result.totalRetirement,true),"#2E5C94"):""}
     ${result.totalHealthIns>0?row("Self-Employed Health Insurance",f(result.totalHealthIns,true),"#2A7878"):""}
-    ${rowB("Total Pre-Tax Deductions",f(result.preTaxDeductions+result.totalHealthIns,true),"#0F1A2E")}
+    ${rowB("Total Above-the-Line",f(result.preTaxDeductions+result.totalHealthIns,true),"#0F1A2E")}
     <div style="height:14px"></div>` : ""}
+  ${result.totalPTET > 0 ? `<div style="font-size:9px;color:#3DDBB4;margin-bottom:14px">PTE credit: ${f(result.totalPTET,true)} (already reflected in K-1 income; applied as state tax credit below)</div>` : ""}
   <div style="font-size:11px;color:#0F1A2E;font-weight:500;margin-bottom:6px">Adjusted Gross Income</div>
   ${row("Total Ordinary Income",f(result.totalOrdinary,true))}
   ${row("Total Preferential Income (LTCG + QDiv)",f(result.totalPref,true))}
@@ -2226,32 +2229,37 @@ function EstTaxTab({ profile, updProfile, result, streams }) {
       </Card>
     </div>
 
-    {/* Entity-Level Deductions */}
+    {/* Above-the-Line Deductions + PTE Credit Info */}
     {(result.totalPTET > 0 || result.totalRetirement > 0 || result.totalHealthIns > 0) && <Card style={{ padding:"16px 20px" }}>
-      <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Entity-level pre-tax deductions"}</div>
-      {result.pteDetails.map((d,i) => (
-        <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
-          <span style={{ fontSize:11, color:C.textDim }}>{"PTE ("}{d.entity}{" - "}{d.rate}{"% "}{d.state}{")"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.accent }}>{fmtD(d.amount, true)}</span>
-        </div>
-      ))}
-      {result.totalRetirement > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"Retirement (401k + PS + DB)"}</span>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.blue }}>{fmtD(result.totalRetirement, true)}</span>
-      </div>}
-      {result.totalHealthIns > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
-        <span style={{ fontSize:11, color:C.textDim }}>{"Self-employed health insurance"}</span>
-        <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.teal }}>{fmtD(result.totalHealthIns, true)}</span>
-      </div>}
-      <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
-        <div style={{ display:"flex", justifyContent:"space-between" }}>
-          <span style={{ fontSize:12, color:C.text }}>{"Total pre-tax deductions"}</span>
-          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.accent }}>{fmtD(result.preTaxDeductions + result.totalHealthIns, true)}</span>
-        </div>
-        {result.pteFedSavings > 0 && <div style={{ fontSize:10, color:C.green, marginTop:4 }}>
-          {"SALT workaround saves ~"}{fmtD(result.pteFedSavings, true)}{" in federal tax by bypassing the $10K SALT cap."}
+      {(result.totalRetirement > 0 || result.totalHealthIns > 0) && <>
+        <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>{"Above-the-line deductions"}</div>
+        {result.totalRetirement > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"Retirement (401k + PS + DB)"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.blue }}>{fmtD(result.totalRetirement, true)}</span>
         </div>}
-      </div>
+        {result.totalHealthIns > 0 && <div style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+          <span style={{ fontSize:11, color:C.textDim }}>{"Self-employed health insurance"}</span>
+          <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.teal }}>{fmtD(result.totalHealthIns, true)}</span>
+        </div>}
+        <div style={{ borderTop:`1px solid ${C.border}`, paddingTop:6, marginTop:4 }}>
+          <div style={{ display:"flex", justifyContent:"space-between" }}>
+            <span style={{ fontSize:12, color:C.text }}>{"Total above-the-line"}</span>
+            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:13, color:C.accent }}>{fmtD(result.preTaxDeductions + result.totalHealthIns, true)}</span>
+          </div>
+        </div>
+      </>}
+      {result.totalPTET > 0 && <div style={{ borderTop:(result.totalRetirement>0||result.totalHealthIns>0)?`1px solid ${C.border}`:"none", paddingTop:8, marginTop:8 }}>
+        <div style={{ fontSize:10, color:C.green, letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:6 }}>{"PTE credit (reflected in K-1)"}</div>
+        {result.pteDetails.map((d,i) => (
+          <div key={i} style={{ display:"flex", justifyContent:"space-between", padding:"4px 0" }}>
+            <span style={{ fontSize:11, color:C.textDim }}>{d.entity}{" — "}{d.rate}{"% "}{d.state}</span>
+            <span style={{ fontFamily:"'IBM Plex Mono',monospace", fontSize:12, color:C.green }}>{fmtD(d.amount, true)}</span>
+          </div>
+        ))}
+        <div style={{ fontSize:10, color:C.textMuted, marginTop:4 }}>
+          {"K-1 income entered is already net of PTE. Credit of "}{fmtD(result.totalPTET, true)}{" applied against state tax. Federal savings ~"}{fmtD(result.pteFedSavings, true)}{" vs. paying state tax personally."}
+        </div>
+      </div>}
     </Card>}
 
     {/* Withholding Sources */}
