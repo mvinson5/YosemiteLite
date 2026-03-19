@@ -17,23 +17,49 @@ const C = {
 };
 
 // ─── 2025 TAX PARAMETERS ────────────────────────────────────────────────────
+// ─── 2026 TAX PARAMETERS (OBBBA + Rev. Proc. 2025-32) ──────────────────────
 const TAX_PARAMS = {
   mfj: {
-    brackets:[[0.10,0,23200],[0.12,23200,94300],[0.22,94300,201050],[0.24,201050,383900],[0.32,383900,487450],[0.35,487450,731200],[0.37,731200,Infinity]],
-    ltcg:[[0,0,96700],[0.15,96700,600050],[0.20,600050,Infinity]],
-    std:30000, niitFloor:250000, qbiLow:383900, qbiHigh:483900,
+    brackets:[[0.10,0,24800],[0.12,24800,100800],[0.22,100800,211400],[0.24,211400,403550],[0.32,403550,512450],[0.35,512450,768700],[0.37,768700,Infinity]],
+    ltcg:[[0,0,98900],[0.15,98900,613700],[0.20,613700,Infinity]],
+    std:32200, niitFloor:250000, qbiLow:403500, qbiHigh:553500,
   },
   single: {
-    brackets:[[0.10,0,11600],[0.12,11600,47150],[0.22,47150,100525],[0.24,100525,191950],[0.32,191950,243725],[0.35,243725,609350],[0.37,609350,Infinity]],
-    ltcg:[[0,0,48350],[0.15,48350,533400],[0.20,533400,Infinity]],
-    std:15000, niitFloor:200000, qbiLow:191950, qbiHigh:241950,
+    brackets:[[0.10,0,12400],[0.12,12400,50400],[0.22,50400,105700],[0.24,105700,201775],[0.32,201775,256225],[0.35,256225,640600],[0.37,640600,Infinity]],
+    ltcg:[[0,0,49450],[0.15,49450,545500],[0.20,545500,Infinity]],
+    std:16100, niitFloor:200000, qbiLow:201775, qbiHigh:276775,
   },
   mfs: {
-    brackets:[[0.10,0,11600],[0.12,11600,47150],[0.22,47150,100525],[0.24,100525,191950],[0.32,191950,243725],[0.35,243725,365600],[0.37,365600,Infinity]],
-    ltcg:[[0,0,48350],[0.15,48350,300025],[0.20,300025,Infinity]],
-    std:15000, niitFloor:125000, qbiLow:191950, qbiHigh:241950,
+    brackets:[[0.10,0,12400],[0.12,12400,50400],[0.22,50400,105700],[0.24,105700,201775],[0.32,201775,256225],[0.35,256225,384350],[0.37,384350,Infinity]],
+    ltcg:[[0,0,49450],[0.15,49450,306850],[0.20,306850,Infinity]],
+    std:16100, niitFloor:125000, qbiLow:201775, qbiHigh:276775,
   },
 };
+// SALT cap: $40,400 in 2026, phased out by 30% of MAGI over $505K, floor $10K
+// PTET bypasses SALT cap entirely (OBBBA did not change PTE workaround)
+const SALT_CAP_2026 = { base: 40400, phaseoutStart: 505000, rate: 0.30, floor: 10000 };
+const computeSaltCap = (agi) => {
+  if (agi <= SALT_CAP_2026.phaseoutStart) return SALT_CAP_2026.base;
+  const reduction = (agi - SALT_CAP_2026.phaseoutStart) * SALT_CAP_2026.rate;
+  return Math.max(SALT_CAP_2026.floor, Math.round(SALT_CAP_2026.base - reduction));
+};
+
+// California progressive brackets (2025 FTB Schedule Y/X, used as 2026 proxy — FTB 2026 not yet published)
+// Plus 1% Mental Health Services Tax on income over $1M (Prop 63)
+const CA_BRACKETS = {
+  mfj: [[0.01,0,22158],[0.02,22158,52528],[0.04,52528,82904],[0.06,82904,115084],[0.08,115084,145448],[0.093,145448,742958],[0.103,742958,891542],[0.113,891542,1485906],[0.123,1485906,Infinity]],
+  single: [[0.01,0,11079],[0.02,11079,26264],[0.04,26264,41452],[0.06,41452,57542],[0.08,57542,72724],[0.093,72724,371479],[0.103,371479,445771],[0.113,445771,742953],[0.123,742953,Infinity]],
+};
+const MHS_THRESHOLD = 1000000; // 1% Mental Health Services Tax on income over $1M
+function computeStateTax(state, filingStatus, taxableIncome) {
+  if (state === "CA") {
+    const brackets = CA_BRACKETS[filingStatus] || CA_BRACKETS.mfj;
+    let tax = bracketTax(taxableIncome, brackets);
+    if (taxableIncome > MHS_THRESHOLD) tax += (taxableIncome - MHS_THRESHOLD) * 0.01;
+    return tax;
+  }
+  return 0; // other states use flat rate fallback
+}
 
 const STATE_RATES = {
   CA:{rate:14.3,label:"California"}, NY:{rate:10.9,label:"New York"},
@@ -186,11 +212,17 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
       ltcg += (item.value||0) * (item.realizedGainPct||0) / 100 * pf;
     } else if (at==="hedgeFund" || at==="peFund") {
       const nav = item.nav || 0;
-      ordInv     += nav * (item.ordPct || 0) / 100 * pf;
+      const ordAmt = nav * (item.ordPct || 0) / 100 * pf;
+      const intAmt = nav * (item.intPct || 0) / 100 * pf;
+      if (item.traderElection) {
+        // §475(f) mark-to-market: ordinary income is trade/business character
+        ordEarned += ordAmt + intAmt;
+      } else {
+        ordInv += ordAmt + intAmt;
+      }
       stcg       += nav * (item.stcgPct || 0) / 100 * pf;
       ltcg       += nav * (item.ltcgPct || 0) / 100 * pf;
       qualDiv    += nav * (item.qualDivPct || 0) / 100 * pf;
-      ordInv     += nav * (item.intPct || 0) / 100 * pf;
       taxExempt  += nav * (item.taxExPct || 0) / 100 * pf;
       invDistributions += nav * (item.distPct || 0) / 100 * pf;
       invCapCalls += (item.unfunded||0) * (item.capCallPct || 0) / 100 * pf;
@@ -296,9 +328,24 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   else if (agi < p.qbiHigh) { const frac = 1-(agi-p.qbiLow)/(p.qbiHigh-p.qbiLow); qbiDeduction = Math.min(qbiBase*frac, Math.max(0,totalOrdinary)*0.20); }
   qbiDeduction = Math.max(0, qbiDeduction);
 
-  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,10000) : t+(d.amount||0), 0) + schedAInterest;
+  const saltCap = computeSaltCap(agi);
+  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,saltCap) : t+(d.amount||0), 0) + schedAInterest;
   const useItemized = itemizedRaw > p.std;
-  const deductionAmt = (useItemized ? itemizedRaw : p.std) + qbiDeduction;
+  
+  // 2/37 rule (OBBBA, starting 2026): limits tax benefit of itemized deductions for 37% bracket
+  // Reduction = (2/37) × min(itemized deductions, taxable income above 37% threshold)
+  const top37Threshold = p.brackets[p.brackets.length-1][1]; // lower bound of 37% bracket
+  let itemizedAfter237 = itemizedRaw;
+  let reduction237 = 0;
+  if (useItemized) {
+    const tentativeTaxableOrd = Math.max(0, totalOrdinary - itemizedRaw - qbiDeduction);
+    const excessOver37 = Math.max(0, tentativeTaxableOrd - top37Threshold);
+    if (excessOver37 > 0) {
+      reduction237 = Math.round((2/37) * Math.min(itemizedRaw, excessOver37));
+      itemizedAfter237 = itemizedRaw - reduction237;
+    }
+  }
+  const deductionAmt = (useItemized ? itemizedAfter237 : p.std) + qbiDeduction;
 
   const taxableOrd = Math.max(0, totalOrdinary - deductionAmt);
   const taxablePref = Math.max(0, totalPref);
@@ -313,7 +360,10 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const niit = Math.min(nii, niitBase) * 0.038;
 
   const federalTax = ordTax + prefTax + niit;
-  const stateGross = Math.max(0, agi * ((profile.stateRate||0)/100) * 0.88);
+  // State tax: progressive brackets for CA, flat rate for others
+  const stateGross = profile.state === "CA"
+    ? computeStateTax("CA", profile.filingStatus, agi)
+    : Math.max(0, agi * ((profile.stateRate||0)/100));
   const stateTaxAfterPTE = Math.max(0, stateGross - totalPTET);
   const stateTax = stateGross; // gross liability before credit
   const totalTax = federalTax + stateTaxAfterPTE;
@@ -389,7 +439,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     netST, netLT, netSTAfter, netLTAfter, capitalLossOffset, capitalLossCarry,
     invOrdinary,
     totalOrdinary, totalPref, agi,
-    qbiDeduction, itemizedRaw, useItemized, deductionAmt,
+    qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap, reduction237, itemizedAfter237,
     taxableOrd, taxablePref,
     ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
@@ -492,18 +542,34 @@ function computeMonthlyCashflow(profile, streams, assets, result, liabilities, e
     // Entity distributions (actual cash received from firms)
     const entDist = distSchedule[i] || 0;
 
-    // Fund distributions (semi-annual Jun/Dec)
-    let fundDist = 0;
-    if ([5,11].includes(i)) fundDist = result.invDistributions / 2;
+    // Fund distributions + cap calls: per-asset timing
+    let fundDist = 0, capCall = 0;
+    (assets||[]).forEach(a => {
+      if (a.assetType !== "hedgeFund" && a.assetType !== "peFund") return;
+      if (!isActiveInMonth(a, i)) return;
+      const nav = a.nav || 0;
+      const endM = a.endMonth ?? 11;
+      const startM = a.startMonth ?? 0;
+      const activeMonths = endM - startM + 1;
+      // Distributions: if asset exits before Dec, full amount in end month; otherwise semi-annual Jun/Dec
+      if ((a.distPct||0) > 0) {
+        if (endM < 11) {
+          if (i === endM) fundDist += nav * (a.distPct/100);
+        } else {
+          if ([5,11].includes(i)) fundDist += nav * (a.distPct/100) * (activeMonths/12) / 2;
+        }
+      }
+      // Cap calls: quarterly within active window
+      if ((a.capCallPct||0) > 0 && (a.unfunded||0) > 0 && [2,5,8,11].includes(i)) {
+        capCall += (a.unfunded) * (a.capCallPct/100) * (activeMonths/12) / 4;
+      }
+    });
 
     const cashIn = streamIn - withholding + entDist + fundDist + assetCashMonthly;
 
     // Outflows
     let estPmt = 0;
     if (qMap[i] !== undefined) estPmt = profile[qMap[i]] || 0;
-
-    let capCall = 0;
-    if ([2,5,8,11].includes(i)) capCall = result.invCapCalls / 4;
 
     let liabPmt = 0;
     (liabilities||[]).forEach(l => { if (isActiveInMonth(l, i)) liabPmt += (l.monthlyPayment||0); });
@@ -855,6 +921,11 @@ function AssetEditor({ asset, onSave, onDelete, entities }) {
       </div>
       <div style={{ fontSize:10, color:C.accent, letterSpacing:"0.12em", textTransform:"uppercase", borderTop:`1px solid ${C.border}`, paddingTop:10 }}>
         {"Layer 2: Tax (Recognized % of NAV)"}
+      </div>
+      <div style={{ display:"flex", alignItems:"center", gap:8, padding:"4px 0" }}>
+        <input type="checkbox" checked={!!a.traderElection} onChange={e => upd("traderElection", e.target.checked)}
+          style={{ accentColor:C.accent }} />
+        <span style={{ fontSize:11, color:C.textDim }}>{"§475(f) trader election — ordinary income treated as trade/business"}</span>
       </div>
       <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
         <Field label="Ordinary %"><Input value={a.ordPct} onChange={e => upd("ordPct", Number(e.target.value))} type="number" /></Field>
@@ -1706,9 +1777,11 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
   const monthly = months.map((m,i) => {
     let si=0,wh=0;
     streams.forEach(s=>{const sm=s.startMonth??0,em=s.endMonth??11;if(i<sm||i>em)return;const ent=entMap[s.entity];if((ent?.actualDistributions||0)>0)return;const t=s.timing||"monthly";let a=0;if(t==="monthly")a=(s.amount||0)/12;else if(t==="quarterly"&&[2,5,8,11].includes(i))a=(s.amount||0)/4;else if(t==="annual"&&i===(s.timingMonth??11))a=s.amount||0;else if(t==="semi"&&[5,11].includes(i))a=(s.amount||0)/2;si+=a;wh+=a*((s.fedWithholdingPct||0)+(s.stateWithholdingPct||0))/100;});
-    const ed=dSched[i]||0;let fd=0;if([5,11].includes(i))fd=result.invDistributions/2;
+    const ed=dSched[i]||0;let fd=0,cc=0;
+    (assets||[]).forEach(a=>{if(a.assetType!=="hedgeFund"&&a.assetType!=="peFund")return;const sm=a.startMonth??0,em=a.endMonth??11;if(i<sm||i>em)return;const nav=a.nav||0;const am=em-sm+1;
+      if((a.distPct||0)>0){if(em<11){if(i===em)fd+=nav*(a.distPct/100);}else{if([5,11].includes(i))fd+=nav*(a.distPct/100)*(am/12)/2;}}
+      if((a.capCallPct||0)>0&&(a.unfunded||0)>0&&[2,5,8,11].includes(i)){cc+=(a.unfunded)*(a.capCallPct/100)*(am/12)/4;}});
     const ci=si-wh+ed+fd+acM;let ep=0;if(qMap[i]!==undefined)ep=profile[qMap[i]]||0;
-    let cc=0;if([2,5,8,11].includes(i))cc=result.invCapCalls/4;
     let lp=0;(liabilities||[]).forEach(l=>{const sm=l.startMonth??0,em=l.endMonth??11;if(i>=sm&&i<=em)lp+=(l.monthlyPayment||0);});
     const n=ci-(profile.livingExpenses||0)-lp-ep-cc-edM;cum+=n;
     return {month:m,cashIn:ci,entDist:ed,estPmt:ep,livingExp:profile.livingExpenses||0,liabPmt:lp,capCall:cc,entDeduc:edM,net:n,cumulative:cum};
@@ -1794,7 +1867,7 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
     <div><div style="font-size:8px;color:#8A8680;letter-spacing:0.1em;text-transform:uppercase">Household</div><div style="font-size:15px;color:#0F1A2E;font-weight:500;margin-top:2px">${profile.name||"Client"}</div></div>
     <div><div style="font-size:8px;color:#8A8680;letter-spacing:0.1em;text-transform:uppercase">Filing</div><div style="font-size:13px;margin-top:2px">${(profile.filingStatus||"").toUpperCase()}</div></div>
     <div><div style="font-size:8px;color:#8A8680;letter-spacing:0.1em;text-transform:uppercase">State</div><div style="font-size:13px;margin-top:2px">${profile.state}</div></div>
-    <div><div style="font-size:8px;color:#8A8680;letter-spacing:0.1em;text-transform:uppercase">Tax Year</div><div style="font-size:13px;margin-top:2px">2025</div></div>
+    <div><div style="font-size:8px;color:#8A8680;letter-spacing:0.1em;text-transform:uppercase">Tax Year</div><div style="font-size:13px;margin-top:2px">2026</div></div>
   </div>
   <div class="hdr">Key Metrics</div>
   <div class="grid3">
@@ -2080,10 +2153,10 @@ function ScenariosTab({ profile, streams, assets, deductions, entities, liabilit
 // ─── ESTIMATED TAX TAB ──────────────────────────────────────────────────────
 function EstTaxTab({ profile, updProfile, result, streams }) {
   const quarters = [
-    { label:"Q1", due:"Apr 15, 2025", field:"q1Paid" },
-    { label:"Q2", due:"Jun 15, 2025", field:"q2Paid" },
-    { label:"Q3", due:"Sep 15, 2025", field:"q3Paid" },
-    { label:"Q4", due:"Jan 15, 2026", field:"q4Paid" },
+    { label:"Q1", due:"Apr 15, 2026", field:"q1Paid" },
+    { label:"Q2", due:"Jun 15, 2026", field:"q2Paid" },
+    { label:"Q3", due:"Sep 15, 2026", field:"q3Paid" },
+    { label:"Q4", due:"Jan 15, 2027", field:"q4Paid" },
   ];
   const target = result.safeHarborTarget;
   const remaining = result.remainingSH;
@@ -2262,7 +2335,7 @@ const PRELOAD_ASSETS = [
   // Hedge Funds (Tier 3)
   {id:"a4",assetType:"hedgeFund",label:"AQR Tax-Aware Delphi Plus Fund",nav:5400000,costBasis:4900000,adjBasis:4500000,unfunded:0,
     totalReturnPct:12,mgmtFee:2.0,perfFee:20,ordPct:-30,stcgPct:0,ltcgPct:25,qualDivPct:5,intPct:0,taxExPct:0,
-    distPct:0,capCallPct:0,entity:"Test Family Trust"},
+    distPct:0,capCallPct:0,traderElection:true,entity:"Test Family Trust"},
   {id:"a5",assetType:"hedgeFund",label:"AQR Flex SMA (F250)",nav:3000000,costBasis:2800000,adjBasis:2800000,unfunded:0,
     totalReturnPct:10,mgmtFee:0.55,perfFee:0,ordPct:0,stcgPct:-50,ltcgPct:0,qualDivPct:1,intPct:0,taxExPct:0,
     distPct:0,capCallPct:0,entity:"Husband"},
@@ -2404,7 +2477,7 @@ export default function YosemitePlatform() {
       <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.navBorder}` }}>
         <input value={profile.name} onChange={e => updProfile("name", e.target.value)} placeholder="Client / Household Name"
           style={{ width: "100%", background: "none", border: "none", fontSize: 12, color: "#FFFFFF", outline: "none" }} />
-        <div style={{ fontSize: 10, color: C.navText, marginTop: 3 }}>{profile.filingStatus.toUpperCase()} {"| "}{STATE_RATES[profile.state]?.label || profile.state}{" | 2025"}</div>
+        <div style={{ fontSize: 10, color: C.navText, marginTop: 3 }}>{profile.filingStatus.toUpperCase()} {"| "}{STATE_RATES[profile.state]?.label || profile.state}{" | 2026"}</div>
       </div>
       {/* Live estimate - above nav */}
       <div style={{ padding: "8px 16px", borderBottom: `1px solid ${C.navBorder}` }}>
