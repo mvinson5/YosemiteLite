@@ -1878,7 +1878,7 @@ function generateReport(profile, result, bs, streams, assets, entities, liabilit
   <div class="grid3">
     ${[{l:"Adjusted Gross Income",v:f(result.agi,true)},{l:"Federal Tax",v:f(result.federalTax,true)},{l:"State Tax (after PTE)",v:f(result.stateTaxAfterPTE,true)},
       {l:"Total Tax Liability",v:f(result.totalTax,true),c:"#C04040"},{l:"Effective Rate",v:p(result.effectiveRate)},{l:"NIIT",v:f(result.niit,true)},
-      {l:"Net Worth",v:f(bs.netWorth,true),c:"#0F1A2E"},{l:"Net Cash After Tax",v:f(result.netCashAfterTax,true),c:result.netCashAfterTax>=0?"#2D8060":"#C04040"},{l:"Marginal Rate (Ord.)",v:p(result.marginalOrd)}
+      {l:"Net Worth",v:f(bs.netWorth,true),c:"#0F1A2E"},{l:"Net Cash After Tax",v:f(result.netCashAfterTax,true),c:result.netCashAfterTax>=0?"#2D8060":"#C04040"},{l:"Marginal Rate (Combined)",v:p(result.combinedMarginalOrd)}
     ].map(k => `<div class="kpi"><div class="kpi-label">${k.l}</div><div class="kpi-val" style="color:${k.c||'#0F1A2E'}">${k.v}</div></div>`).join("")}
   </div>
   ${result.phantomIncome > 0 ? `<div class="callout" style="background:#FDF4F4;border:1px solid #E8CCCC">
