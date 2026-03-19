@@ -7,19 +7,37 @@
  * Run: node tax-engine-tests.js
  */
 
-// ─── EXTRACTED TAX PARAMS (2025) ───────────────────────────────────────────
+// ─── EXTRACTED TAX PARAMS (2026 — OBBBA + Rev. Proc. 2025-32) ──────────────
 const TAX_PARAMS = {
   mfj: {
-    brackets:[[0.10,0,23200],[0.12,23200,94300],[0.22,94300,201050],[0.24,201050,383900],[0.32,383900,487450],[0.35,487450,731200],[0.37,731200,Infinity]],
-    ltcg:[[0,0,96700],[0.15,96700,600050],[0.20,600050,Infinity]],
-    std:30000, niitFloor:250000, qbiLow:383900, qbiHigh:483900,
+    brackets:[[0.10,0,24800],[0.12,24800,100800],[0.22,100800,211400],[0.24,211400,403550],[0.32,403550,512450],[0.35,512450,768700],[0.37,768700,Infinity]],
+    ltcg:[[0,0,98900],[0.15,98900,613700],[0.20,613700,Infinity]],
+    std:32200, niitFloor:250000, qbiLow:403500, qbiHigh:553500,
   },
   single: {
-    brackets:[[0.10,0,11600],[0.12,11600,47150],[0.22,47150,100525],[0.24,100525,191950],[0.32,191950,243725],[0.35,243725,609350],[0.37,609350,Infinity]],
-    ltcg:[[0,0,48350],[0.15,48350,533400],[0.20,533400,Infinity]],
-    std:15000, niitFloor:200000, qbiLow:191950, qbiHigh:241950,
+    brackets:[[0.10,0,12400],[0.12,12400,50400],[0.22,50400,105700],[0.24,105700,201775],[0.32,201775,256225],[0.35,256225,640600],[0.37,640600,Infinity]],
+    ltcg:[[0,0,49450],[0.15,49450,545500],[0.20,545500,Infinity]],
+    std:16100, niitFloor:200000, qbiLow:201775, qbiHigh:276775,
   },
 };
+const computeSaltCap = (agi) => {
+  const base = 40400, start = 505000, rate = 0.30, floor = 10000;
+  if (agi <= start) return base;
+  return Math.max(floor, Math.round(base - (agi - start) * rate));
+};
+const CA_BRACKETS = {
+  mfj: [[0.01,0,22158],[0.02,22158,52528],[0.04,52528,82904],[0.06,82904,115084],[0.08,115084,145448],[0.093,145448,742958],[0.103,742958,891542],[0.113,891542,1485906],[0.123,1485906,Infinity]],
+  single: [[0.01,0,11079],[0.02,11079,26264],[0.04,26264,41452],[0.06,41452,57542],[0.08,57542,72724],[0.093,72724,371479],[0.103,371479,445771],[0.113,445771,742953],[0.123,742953,Infinity]],
+};
+function computeStateTax(state, filingStatus, taxableIncome) {
+  if (state === "CA") {
+    const brackets = CA_BRACKETS[filingStatus] || CA_BRACKETS.mfj;
+    let tax = bracketTax(taxableIncome, brackets);
+    if (taxableIncome > 1000000) tax += (taxableIncome - 1000000) * 0.01;
+    return tax;
+  }
+  return 0;
+}
 
 const INCOME_TYPES = {
   wages:     { char: "ordEarned" },
@@ -197,7 +215,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   else if (agi < p.qbiHigh) { const frac = 1-(agi-p.qbiLow)/(p.qbiHigh-p.qbiLow); qbiDeduction = Math.min(qbiBase*frac, Math.max(0,totalOrdinary)*0.20); }
   qbiDeduction = Math.max(0, qbiDeduction);
 
-  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,10000) : t+(d.amount||0), 0) + schedAInterest;
+  const itemizedRaw = deductions.reduce((t,d) => d.type==="salt" ? t+Math.min(d.amount||0,computeSaltCap(agi)) : t+(d.amount||0), 0) + schedAInterest;
   const useItemized = itemizedRaw > p.std;
   const deductionAmt = (useItemized ? itemizedRaw : p.std) + qbiDeduction;
   const taxableOrd = Math.max(0, totalOrdinary - deductionAmt);
@@ -210,7 +228,9 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const niit = Math.min(nii, niitBase) * 0.038;
 
   const federalTax = ordTax + prefTax + niit;
-  const stateGross = Math.max(0, agi * ((profile.stateRate||0)/100) * 0.88);
+  const stateGross = profile.state === "CA"
+    ? computeStateTax("CA", profile.filingStatus, agi)
+    : Math.max(0, agi * ((profile.stateRate||0)/100));
   const stateTaxAfterPTE = Math.max(0, stateGross - totalPTET);
   const stateTax = stateGross;
   const totalTax = federalTax + stateTaxAfterPTE;
@@ -230,8 +250,9 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
   const remainingSH = safeHarborPY>0 ? Math.max(0,safeHarborTarget-totalPrepaid) : 0;
   const penaltyEst = remainingSH * 0.08;
   const balanceDueFed = Math.max(0, federalTax - totalFedWithholding - totalEstPaid);
-  const balanceDueState = Math.max(0, stateGross - totalPTET - totalStateWithholding);
+  const balanceDueState = Math.max(0, stateTaxAfterPTE - totalStateWithholding);
   const overpaymentFed = Math.max(0, totalFedWithholding + totalEstPaid - federalTax);
+  const overpaymentState = Math.max(0, totalStateWithholding - stateTaxAfterPTE);
 
   const totalWithholding = totalFedWithholding + totalStateWithholding;
 
@@ -272,7 +293,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     ordEarned, ordInv, stcg, ltcg, qualDiv, passive, passiveAllowed, suspendedPAL, taxExempt,
     netST, netLT, netSTAfter, netLTAfter, capitalLossOffset, capitalLossCarry,
     invOrdinary, totalOrdinary, totalPref, agi,
-    qbiDeduction, itemizedRaw, useItemized, deductionAmt,
+    qbiDeduction, itemizedRaw, useItemized, deductionAmt, saltCap: computeSaltCap(agi),
     taxableOrd, taxablePref,
     ordTax, prefTax, niit, nii, federalTax, stateTax, stateTaxAfterPTE, totalTax,
     effectiveRate: agi>0 ? totalTax/agi*100 : 0,
@@ -282,7 +303,7 @@ function computeTax(profile, streams, assets, deductions, entities, liabilities)
     streamCashIn, distCashIn, assetCashIn, entityDeducNonDist,
     totalFedWithholding, totalStateWithholding, totalWithholding,
     safeHarborPY, safeHarborCY, safeHarborTarget, totalEstPaid, totalPrepaid,
-    remainingSH, penaltyEst, balanceDueFed, balanceDueState, overpaymentFed,
+    remainingSH, penaltyEst, balanceDueFed, balanceDueState, overpaymentFed, overpaymentState,
     invDistributions, invCapCalls, invTaxExempt: taxExempt, reCashFlow,
     schedAInterest, totalLiabPayments,
     netCashAfterTax, ordLossBenefit,
@@ -325,22 +346,22 @@ assert("$23,200 → fills 10%", bracketTax(23200, mfjBrackets), 2320);
 
 // $50,000 — 10% bracket + partial 12%
 // 23200 * 0.10 + (50000-23200) * 0.12 = 2320 + 3216 = 5536
-assert("$50K → 10% + 12%", bracketTax(50000, mfjBrackets), 5536);
+assert("$50K → 10% + 12%", bracketTax(50000, mfjBrackets), 5504);
 
 // $100,000 — 10% + 12% + partial 22%
 // 2320 + (94300-23200)*0.12 + (100000-94300)*0.22 = 2320 + 8532 + 1254 = 12106
-assert("$100K → through 22%", bracketTax(100000, mfjBrackets), 12106);
+assert("$100K → through 22%", bracketTax(100000, mfjBrackets), 11504);
 
 // $500,000 — through 32%
 // 10%: 2320, 12%: 8532, 22%: 23485, 24%: 43884, 32%: 33136, 35%: 4392.50
 // Total: 115749.50
-assert("$500K → through 35%", bracketTax(500000, mfjBrackets), 115749.50);
+assert("$500K → through 35%", bracketTax(500000, mfjBrackets), 112912);
 
 // $1,000,000
 // Add 35%: (731200-500000)*0.35 = 80920 → but wait, need full calc
 // 10%: 2320, 12%: 8532, 22%: 23485, 24%: 43884, 32%: 33136, 35%: 85312.50, 37%: (1000000-731200)*0.37 = 99456
 // Total: 296125.50
-assert("$1M → through 37%", bracketTax(1000000, mfjBrackets), 296125.50);
+assert("$1M → through 37%", bracketTax(1000000, mfjBrackets), 292164.50);
 
 // ─── TEST 2: LTCG STACKING ─────────────────────────────────────────────────
 section("2. ltcgStack() — LTCG on Top of Ordinary (MFJ)");
@@ -350,17 +371,17 @@ const mfjLtcg = TAX_PARAMS.mfj.ltcg;
 // $50K ordinary + $30K LTCG: total $80K, all under $96,700 → 0% LTCG
 assert("$50K ord + $30K LTCG → 0% rate", ltcgStack(50000, 30000, mfjLtcg), 0);
 
-// $90K ordinary + $20K LTCG: stack hits $110K, crosses $96,700
+// $90K ordinary + $20K LTCG: stack hits $110K, crosses $98,900
 // 0%: 96700-90000 = 6700 at 0%, 15%: 20000-6700 = 13300 at 15% = 1995
-assert("$90K ord + $20K LTCG → partial 15%", ltcgStack(90000, 20000, mfjLtcg), 1995);
+assert("$90K ord + $20K LTCG → partial 15%", ltcgStack(90000, 20000, mfjLtcg), 1665);
 
-// $500K ordinary + $200K LTCG: stack reaches $700K, crosses $600,050 threshold
+// $500K ordinary + $200K LTCG: stack reaches $700K, crosses $613,700 threshold
 // 15%: (600050-500000) = 100050 at 15% = 15007.50, 20%: (700000-600050) = 99950 at 20% = 19990
-assert("$500K ord + $200K LTCG → crosses 20%", ltcgStack(500000, 200000, mfjLtcg), 34997.50);
+assert("$500K ord + $200K LTCG → crosses 20%", ltcgStack(500000, 200000, mfjLtcg), 34315);
 
 // $600K ordinary + $100K LTCG: crosses into 20%
 // 15%: (600050-600000) = 50 at 15% = 7.50, 20%: 99950 at 20% = 19990
-assert("$600K ord + $100K LTCG → mostly 20%", ltcgStack(600000, 100000, mfjLtcg), 19997.50);
+assert("$600K ord + $100K LTCG → mostly 20%", ltcgStack(600000, 100000, mfjLtcg), 19315);
 
 // $700K ordinary + $500K LTCG: all at 20%
 assert("$700K ord + $500K LTCG → all 20%", ltcgStack(700000, 500000, mfjLtcg), 100000);
@@ -523,13 +544,13 @@ assert("Pure W-2 → NIIT = 0", niitEarnedOnly.niit, 0);
 // ─── TEST 7: DEDUCTIONS — SALT CAP + ITEMIZED VS STANDARD ──────────────────
 section("7. Deductions — SALT Cap, Itemized vs. Standard");
 
-// SALT capped at $10K
+// SALT: $300K AGI is below $505K phaseout, cap = $40,400
 const deductResult = computeTax(
   { filingStatus: "mfj", state: "CA", stateRate: 14.3 },
   [{ type: "wages", amount: 300000, entity: "Self" }],
   [], 
   [
-    { type: "salt", amount: 50000 }, // capped at 10K
+    { type: "salt", amount: 50000 }, // capped at $40,400
     { type: "mortgage", amount: 20000 },
     { type: "charitable", amount: 15000 },
   ],
@@ -538,9 +559,9 @@ const deductResult = computeTax(
 // Itemized: 10K (SALT capped) + 20K + 15K = 45K
 // Standard: 30K
 // Use itemized (45K > 30K)
-assert("SALT capped at $10K", deductResult.itemizedRaw, 45000);
-assert("Uses itemized (45K > 30K)", deductResult.useItemized, 1, 0);
-assert("Deduction amount = 45K", deductResult.deductionAmt, 45000);
+assert("SALT capped at $40,400", deductResult.itemizedRaw, 75400);
+assert("Uses itemized ($75K > $32K)", deductResult.useItemized, 1, 0);
+assert("Deduction amount = $75,400", deductResult.deductionAmt, 75400);
 
 // Low deductions → standard wins
 const stdResult = computeTax(
@@ -551,7 +572,7 @@ const stdResult = computeTax(
   []
 );
 assert("Low itemized → standard deduction", stdResult.useItemized, 0, 0);
-assert("Standard deduction = $30K", stdResult.deductionAmt, 30000);
+assert("Standard deduction = $32,200", stdResult.deductionAmt, 32200);
 
 // ─── TEST 8: PTET — ENTITY-LEVEL ───────────────────────────────────────────
 section("8. PTET — Entity-Level Pass-Through Entity Tax");
